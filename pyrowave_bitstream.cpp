@@ -272,4 +272,110 @@ void BitstreamParser::mark_frame_decoded()
 {
 	decoded_frame_for_current_sequence = true;
 }
+
+//////
+// Encoder side.
+
+int compute_block_count_per_subdivision(int num_blocks)
+{
+	int per_subdivision = align(num_blocks, BlockSpaceSubdivision) / BlockSpaceSubdivision;
+
+	// Round up to a power of two.
+	int pot = 1;
+	while (pot < per_subdivision)
+		pot *= 2;
+
+	return pot;
+}
+
+size_t compute_num_packets(const BlockLayout &layout, const void *mapped_meta, size_t packet_boundary)
+{
+	auto *meta = static_cast<const BitstreamPacket *>(mapped_meta);
+	size_t num_packets = 0;
+	size_t size_in_packet = 0;
+
+	size_in_packet += sizeof(BitstreamSequenceHeader);
+
+	for (int i = 0; i < layout.block_count_32x32; i++)
+	{
+		size_t packet_size = meta[i].num_words * sizeof(uint32_t);
+		if (!packet_size)
+			continue;
+
+		if (size_in_packet + packet_size > packet_boundary)
+		{
+			size_in_packet = 0;
+			num_packets++;
+		}
+
+		size_in_packet += packet_size;
+	}
+
+	if (size_in_packet)
+		num_packets++;
+
+	return num_packets;
+}
+
+size_t packetize(const BlockLayout &layout, Packet *packets, size_t packet_boundary,
+                 void *output_bitstream_, size_t size,
+                 const void *mapped_meta, const void *mapped_bitstream)
+{
+	size_t num_packets = 0;
+	size_t size_in_packet = 0;
+	size_t packet_offset = 0;
+	size_t output_offset = 0;
+	auto *meta = static_cast<const BitstreamPacket *>(mapped_meta);
+	auto *input_bitstream = static_cast<const uint32_t *>(mapped_bitstream);
+	auto *output_bitstream = static_cast<uint8_t *>(output_bitstream_);
+
+	size_t num_non_zero_blocks = 0;
+	for (int i = 0; i < layout.block_count_32x32; i++)
+		if (meta[i].num_words != 0)
+			num_non_zero_blocks++;
+
+	BitstreamSequenceHeader header = {};
+	header.width_minus_1 = layout.width - 1;
+	header.height_minus_1 = layout.height - 1;
+	header.sequence = reinterpret_cast<const BitstreamHeader *>(input_bitstream + meta[0].offset_u32)->sequence;
+	header.extended = 1;
+	header.code = BITSTREAM_EXTENDED_CODE_START_OF_FRAME;
+	header.total_blocks = uint32_t(num_non_zero_blocks);
+	header.chroma_resolution = layout.chroma == ChromaSubsampling::Chroma444 ?
+	                           CHROMA_RESOLUTION_444 : CHROMA_RESOLUTION_420;
+
+	if (sizeof(header) > size)
+		return 0;
+
+	memcpy(output_bitstream, &header, sizeof(header));
+	output_offset += sizeof(header);
+	size_in_packet += sizeof(header);
+
+	for (int i = 0; i < layout.block_count_32x32; i++)
+	{
+		size_t packet_size = meta[i].num_words * sizeof(uint32_t);
+		if (!packet_size)
+			continue;
+
+		if (size_in_packet + packet_size > packet_boundary)
+		{
+			packets[num_packets++] = { packet_offset, size_in_packet };
+			size_in_packet = 0;
+			packet_offset = output_offset;
+		}
+
+		if (output_offset + packet_size > size)
+			return num_packets;
+
+		memcpy(output_bitstream + output_offset, input_bitstream + meta[i].offset_u32, packet_size);
+
+		output_offset += packet_size;
+		size_in_packet += packet_size;
+	}
+
+	if (size_in_packet)
+		packets[num_packets++] = { packet_offset, size_in_packet };
+
+	return num_packets;
+}
 }

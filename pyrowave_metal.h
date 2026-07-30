@@ -70,9 +70,11 @@ typedef enum pyrowave_chroma_subsampling
 typedef void *pyrowave_mtl_device;         // id<MTLDevice>
 typedef void *pyrowave_mtl_command_buffer; // id<MTLCommandBuffer>
 typedef void *pyrowave_mtl_texture;        // id<MTLTexture>
+typedef void *pyrowave_iosurface;          // IOSurfaceRef
 
 typedef struct pyrowave_device_opaque *pyrowave_device;
 typedef struct pyrowave_decoder_opaque *pyrowave_decoder;
+typedef struct pyrowave_encoder_opaque *pyrowave_encoder;
 
 typedef void (*pyrowave_message_cb)(void *userdata, const char *msg);
 
@@ -118,6 +120,104 @@ pyrowave_device_create(const pyrowave_device_create_info *info, pyrowave_device 
 // All decoders created from this device must be destroyed first.
 PYROWAVE_PUBLIC_API void
 pyrowave_device_destroy(pyrowave_device device);
+
+//////
+// Encoder
+
+typedef struct pyrowave_encoder_create_info
+{
+	pyrowave_device device;
+
+	// Luma dimensions. For 420 subsampling both must be even.
+	// Both must be in the range [1, 16384], as the bitstream encodes them in 14 bits.
+	int width;
+	int height;
+
+	pyrowave_chroma_subsampling chroma;
+} pyrowave_encoder_create_info;
+
+typedef struct pyrowave_packet
+{
+	size_t offset;
+	size_t size;
+} pyrowave_packet;
+
+typedef struct pyrowave_rate_control
+{
+	// Very basic, target bitstream for an image must not exceed this size.
+	size_t maximum_bitstream_size;
+} pyrowave_rate_control;
+
+typedef enum pyrowave_cpu_buffer_format
+{
+	PYROWAVE_CPU_BUFFER_FORMAT_NV12 = 0,    // 2 planes. Y in 8bpp, then CbCr interleaved in 16bpp.
+	PYROWAVE_CPU_BUFFER_FORMAT_YUV420P = 1, // 3 planes, half resolution chroma.
+	PYROWAVE_CPU_BUFFER_FORMAT_YUV444P = 2, // 3 planes, full resolution chroma.
+	PYROWAVE_CPU_BUFFER_FORMAT_INT_MAX = 0x7fffffff
+} pyrowave_cpu_buffer_format;
+
+typedef struct pyrowave_cpu_buffer
+{
+	// Read-only in the encoder. NV12 uses data[0] and data[1] only.
+	const void *data[3];
+	// Must be at least the plane's width times its texel size.
+	size_t row_stride_in_bytes[3];
+	// Must be at least row_stride times the plane's height.
+	size_t plane_size_in_bytes[3];
+	// Luma dimensions; chroma extent is implied by the format.
+	// Must match the dimensions the encoder was created with.
+	int width;
+	int height;
+	pyrowave_cpu_buffer_format format;
+} pyrowave_cpu_buffer;
+
+// IOSurface input for the encoder. Two layouts are accepted:
+//   - one biplanar NV12 surface in planes[0], with planes[1] and planes[2] NULL
+//   - three single plane R8 surfaces, one per YUV component
+// The library wraps these in MTLTextures itself, so the caller does not have to
+// match any particular pixel format or usage. For the NV12 case the chroma plane
+// is bound twice with different channel swizzles rather than being deinterleaved,
+// so neither layout costs a copy.
+//
+// Note this differs from pyrowave_gpu_buffers, which the decoder uses: the decoder
+// writes into caller owned textures and so needs them created with the right usage,
+// whereas the encoder only reads and can wrap whatever it is given.
+typedef struct pyrowave_gpu_input
+{
+	pyrowave_iosurface planes[3];
+} pyrowave_gpu_input;
+
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encoder *encoder);
+
+PYROWAVE_PUBLIC_API void
+pyrowave_encoder_destroy(pyrowave_encoder encoder);
+
+// Both encode entry points submit GPU work and return without blocking; the
+// subsequent packet queries block until it has finished. Encoding again clobbers
+// the previous frame's result. The bitstream carries a small sequence counter so
+// the decoder can track frame ordering.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_encode_gpu_synchronous(pyrowave_encoder encoder,
+                                        const pyrowave_gpu_input *input,
+                                        const pyrowave_rate_control *rate_control);
+
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_encode_cpu_synchronous(pyrowave_encoder encoder,
+                                        const pyrowave_cpu_buffer *input,
+                                        const pyrowave_rate_control *rate_control);
+
+// Only valid after a successful encode, and only for that frame. Reports how many
+// packets the frame needs if each may carry at most packet_boundary bytes.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_compute_num_packets(pyrowave_encoder encoder, size_t packet_boundary,
+                                     size_t *num_packets);
+
+// `packets` must have room for at least the count reported above.
+PYROWAVE_PUBLIC_API pyrowave_result
+pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_packet *packets,
+                           size_t packet_boundary, size_t *out_packets,
+                           void *bitstream, size_t size);
 
 //////
 // Decoder

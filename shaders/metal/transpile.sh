@@ -39,6 +39,20 @@ glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
 	-DSTORAGE_MODE=0 -Ishaders \
 	-o "$TMP/wavelet_dequant.spv" shaders/wavelet_dequant.comp
 
+# Encoder. dwt mirrors idwt's three precision variants; the rest are invariant.
+glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
+	-DPRECISION=2 -DFP16=0 -Ishaders -o "$TMP/dwt.spv" shaders/dwt.comp
+glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
+	-DPRECISION=1 -DFP16=1 -Ishaders -o "$TMP/dwt_fp16_storage.spv" shaders/dwt.comp
+glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
+	-DPRECISION=0 -DFP16=1 -Ishaders -o "$TMP/dwt_fp16.spv" shaders/dwt.comp
+
+for enc_shader in wavelet_quant analyze_rate_control analyze_rate_control_finalize \
+	resolve_rate_control block_packing; do
+	glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" -Ishaders \
+		-o "$TMP/$enc_shader.spv" "shaders/$enc_shader.comp"
+done
+
 # Both modules declare main(), so rename them to get useful names in Metal GPU
 # captures. Note the two sources still cannot be concatenated: SPIRV-Cross emits
 # its own copy of spvUnsafeArray and a differently shaped Registers struct into
@@ -58,6 +72,19 @@ spirv-cross --msl --msl-version 30000 \
 spirv-cross --msl --msl-version 30000 \
 	--rename-entry-point main pyrowave_wavelet_dequant comp \
 	"$TMP/wavelet_dequant.spv" --output "$OUT/wavelet_dequant.metal"
+
+for enc_shader in dwt dwt_fp16_storage dwt_fp16; do
+	spirv-cross --msl --msl-version 30000 \
+		--rename-entry-point main pyrowave_dwt comp \
+		"$TMP/$enc_shader.spv" --output "$OUT/$enc_shader.metal"
+done
+
+for enc_shader in wavelet_quant analyze_rate_control analyze_rate_control_finalize \
+	resolve_rate_control block_packing; do
+	spirv-cross --msl --msl-version 30000 \
+		--rename-entry-point main "pyrowave_$enc_shader" comp \
+		"$TMP/$enc_shader.spv" --output "$OUT/$enc_shader.metal"
+done
 
 # The decoder compiles the MSL at runtime, so embed both sources as string
 # literals rather than shipping a separate .metallib.
@@ -84,7 +111,14 @@ EMBED=$OUT/pyrowave_msl.h
 	echo "static const char wavelet_dequant_msl_source[] = R\"PYROWAVE_MSL("
 	cat "$OUT/wavelet_dequant.metal"
 	echo ")PYROWAVE_MSL\";"
+	for enc_shader in dwt dwt_fp16_storage dwt_fp16 wavelet_quant analyze_rate_control \
+		analyze_rate_control_finalize resolve_rate_control block_packing; do
+		echo
+		echo "static const char ${enc_shader}_msl_source[] = R\"PYROWAVE_MSL("
+		cat "$OUT/$enc_shader.metal"
+		echo ")PYROWAVE_MSL\";"
+	done
 	echo "}"
 } > "$EMBED"
 
-echo "Wrote $OUT/idwt.metal, $OUT/idwt_fp16.metal, $OUT/wavelet_dequant.metal and $EMBED"
+echo "Wrote decode + encode MSL into $OUT and $EMBED"

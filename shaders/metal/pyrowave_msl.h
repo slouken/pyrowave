@@ -1515,4 +1515,2812 @@ kernel void pyrowave_wavelet_dequant(const device void* spvBufferAliasSet0Bindin
 }
 
 )PYROWAVE_MSL";
+
+static const char dwt_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+struct Registers
+{
+    int2 resolution;
+    float2 inv_resolution;
+    int2 aligned_resolution;
+};
+
+constant bool DCShift_tmp [[function_constant(0)]];
+constant bool DCShift = is_function_constant_defined(DCShift_tmp) ? DCShift_tmp : false;
+
+static inline __attribute__((always_inline))
+int2 unswizzle8x8(thread const uint& index)
+{
+    uint y = extract_bits(index, uint(0), uint(1));
+    uint x = extract_bits(index, uint(1), uint(2));
+    y |= (extract_bits(index, uint(3), uint(2)) << uint(1));
+    x |= (extract_bits(index, uint(5), uint(1)) << uint(2));
+    return int2(int(x), int(y));
+}
+
+static inline __attribute__((always_inline))
+float2 generate_mirror_uv(thread int2& coord, constant Registers& _104)
+{
+    coord -= int2(coord < int2(0));
+    coord += int2(1);
+    int2 end_mirrored_clamp = (int2(2) * _104.aligned_resolution) - _104.resolution;
+    int2 past_wrapped_coord = (coord + (int2(2) * (_104.resolution - _104.aligned_resolution))) + int2(1);
+    coord = select(min(coord, _104.resolution), past_wrapped_coord, coord >= end_mirrored_clamp);
+    return float2(coord) * _104.inv_resolution;
+}
+
+static inline __attribute__((always_inline))
+void store_shared(thread const uint& y, thread const uint& x, thread const float2& v, threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20>& shared_block)
+{
+    shared_block[y][x] = v;
+}
+
+static inline __attribute__((always_inline))
+void load_image_with_apron(threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20>& shared_block, constant Registers& _104, thread uint3& gl_WorkGroupID, thread uint& local_index, texture2d<float> uTexture, sampler uTextureSmplr)
+{
+    int2 base_coord = (int2(gl_WorkGroupID.xy) * int2(32)) - int2(4);
+    uint param = local_index;
+    int2 local_coord0 = int2(2) * unswizzle8x8(param);
+    int2 coord0 = base_coord + local_coord0;
+    int2 param_1 = coord0;
+    float2 _178 = generate_mirror_uv(param_1, _104);
+    float4 texels0 = uTexture.gather(uTextureSmplr, _178, int2(0), component::x).wzxy;
+    int2 param_2 = coord0 + int2(16, 0);
+    float2 _188 = generate_mirror_uv(param_2, _104);
+    float4 texels1 = uTexture.gather(uTextureSmplr, _188, int2(0), component::x).wzxy;
+    int2 param_3 = coord0 + int2(0, 16);
+    float2 _197 = generate_mirror_uv(param_3, _104);
+    float4 texels2 = uTexture.gather(uTextureSmplr, _197, int2(0), component::x).wzxy;
+    int2 param_4 = coord0 + int2(16);
+    float2 _206 = generate_mirror_uv(param_4, _104);
+    float4 texels3 = uTexture.gather(uTextureSmplr, _206, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels0 -= float4(0.5);
+        texels1 -= float4(0.5);
+        texels2 -= float4(0.5);
+        texels3 -= float4(0.5);
+    }
+    int local_coord0_y_half = local_coord0.y >> 1;
+    uint param_5 = uint(local_coord0_y_half + 0);
+    uint param_6 = uint(local_coord0.x + 0);
+    float2 param_7 = texels0.xz;
+    store_shared(param_5, param_6, param_7, shared_block);
+    uint param_8 = uint(local_coord0_y_half + 0);
+    uint param_9 = uint(local_coord0.x + 1);
+    float2 param_10 = texels0.yw;
+    store_shared(param_8, param_9, param_10, shared_block);
+    uint param_11 = uint(local_coord0_y_half + 0);
+    uint param_12 = uint(local_coord0.x + 16);
+    float2 param_13 = texels1.xz;
+    store_shared(param_11, param_12, param_13, shared_block);
+    uint param_14 = uint(local_coord0_y_half + 0);
+    uint param_15 = uint(local_coord0.x + 17);
+    float2 param_16 = texels1.yw;
+    store_shared(param_14, param_15, param_16, shared_block);
+    uint param_17 = uint(local_coord0_y_half + 8);
+    uint param_18 = uint(local_coord0.x + 0);
+    float2 param_19 = texels2.xz;
+    store_shared(param_17, param_18, param_19, shared_block);
+    uint param_20 = uint(local_coord0_y_half + 8);
+    uint param_21 = uint(local_coord0.x + 1);
+    float2 param_22 = texels2.yw;
+    store_shared(param_20, param_21, param_22, shared_block);
+    uint param_23 = uint(local_coord0_y_half + 8);
+    uint param_24 = uint(local_coord0.x + 16);
+    float2 param_25 = texels3.xz;
+    store_shared(param_23, param_24, param_25, shared_block);
+    uint param_26 = uint(local_coord0_y_half + 8);
+    uint param_27 = uint(local_coord0.x + 17);
+    float2 param_28 = texels3.yw;
+    store_shared(param_26, param_27, param_28, shared_block);
+    int2 local_coord = int2(int(32u + (2u * (local_index % 4u))), int(2u * (local_index / 4u)));
+    int2 param_29 = base_coord + local_coord;
+    float2 _357 = generate_mirror_uv(param_29, _104);
+    float4 texels = uTexture.gather(uTextureSmplr, _357, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels -= float4(0.5);
+    }
+    uint param_30 = uint(local_coord.y >> 1);
+    uint param_31 = uint(local_coord.x + 0);
+    float2 param_32 = texels.xz;
+    store_shared(param_30, param_31, param_32, shared_block);
+    uint param_33 = uint(local_coord.y >> 1);
+    uint param_34 = uint(local_coord.x + 1);
+    float2 param_35 = texels.yw;
+    store_shared(param_33, param_34, param_35, shared_block);
+    int2 local_coord_1 = int2(int(2u * (local_index % 16u)), int(32u + (2u * (local_index / 16u))));
+    int2 param_36 = base_coord + local_coord_1;
+    float2 _411 = generate_mirror_uv(param_36, _104);
+    float4 texels_1 = uTexture.gather(uTextureSmplr, _411, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels_1 -= float4(0.5);
+    }
+    uint param_37 = uint(local_coord_1.y >> 1);
+    uint param_38 = uint(local_coord_1.x + 0);
+    float2 param_39 = texels_1.xz;
+    store_shared(param_37, param_38, param_39, shared_block);
+    uint param_40 = uint(local_coord_1.y >> 1);
+    uint param_41 = uint(local_coord_1.x + 1);
+    float2 param_42 = texels_1.yw;
+    store_shared(param_40, param_41, param_42, shared_block);
+    if (local_index < 16u)
+    {
+        int2 local_coord_2 = int2(int(32u + (2u * (local_index % 4u))), int(32u + (2u * (local_index / 4u))));
+        int2 param_43 = base_coord + local_coord_2;
+        float2 _469 = generate_mirror_uv(param_43, _104);
+        float4 texels_2 = uTexture.gather(uTextureSmplr, _469, int2(0), component::x).wzxy;
+        if (DCShift)
+        {
+            texels_2 -= float4(0.5);
+        }
+        uint param_44 = uint(local_coord_2.y >> 1);
+        uint param_45 = uint(local_coord_2.x + 0);
+        float2 param_46 = texels_2.xz;
+        store_shared(param_44, param_45, param_46, shared_block);
+        uint param_47 = uint(local_coord_2.y >> 1);
+        uint param_48 = uint(local_coord_2.x + 1);
+        float2 param_49 = texels_2.yw;
+        store_shared(param_47, param_48, param_49, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+float2 load_shared(thread const uint& y, thread const uint& x, threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20>& shared_block)
+{
+    return shared_block[y][x];
+}
+
+static inline __attribute__((always_inline))
+void forward_transform8x2(threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(8u * (local_index % 4u)), int(local_index / 4u));
+    spvUnsafeArray<float2, 16> values;
+    for (int i = 0; i < 16; i++)
+    {
+        uint param = uint(local_coord.y);
+        uint param_1 = uint(local_coord.x + i);
+        float2 v = load_shared(param, param_1, shared_block);
+        values[i] = v;
+    }
+    for (int i_1 = 1; i_1 < 15; i_1 += 2)
+    {
+        values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * (-1.58613431453704833984375));
+    }
+    for (int i_2 = 2; i_2 < 14; i_2 += 2)
+    {
+        values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * (-0.052980117499828338623046875));
+    }
+    for (int i_3 = 3; i_3 < 13; i_3 += 2)
+    {
+        values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * 0.88291108608245849609375);
+    }
+    for (int i_4 = 4; i_4 < 12; i_4 += 2)
+    {
+        values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * 0.4435068666934967041015625);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i_5 = 2; i_5 < 6; i_5++)
+    {
+        float2 a = values[(2 * i_5) + 0];
+        float2 b = values[(2 * i_5) + 1];
+        a *= 0.812893092632293701171875;
+        b *= 1.23017406463623046875;
+        float2 t0 = float2(a.x, b.x);
+        float2 t1 = float2(a.y, b.y);
+        int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+        uint param_2 = uint(y_coord);
+        uint param_3 = uint((2 * local_coord.y) + 0);
+        float2 param_4 = t0;
+        store_shared(param_2, param_3, param_4, shared_block);
+        uint param_5 = uint(y_coord);
+        uint param_6 = uint((2 * local_coord.y) + 1);
+        float2 param_7 = t1;
+        store_shared(param_5, param_6, param_7, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+void forward_transform4x2(thread const bool& active_lane, thread const int& y_offset, threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(4u * (local_index % 8u)), int((local_index / 8u) + uint(y_offset)));
+    spvUnsafeArray<float2, 12> values;
+    if (active_lane)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            uint param = uint(local_coord.y);
+            uint param_1 = uint(local_coord.x + i);
+            float2 v = load_shared(param, param_1, shared_block);
+            values[i] = v;
+        }
+        for (int i_1 = 1; i_1 < 11; i_1 += 2)
+        {
+            values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * (-1.58613431453704833984375));
+        }
+        for (int i_2 = 2; i_2 < 10; i_2 += 2)
+        {
+            values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * (-0.052980117499828338623046875));
+        }
+        for (int i_3 = 3; i_3 < 9; i_3 += 2)
+        {
+            values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * 0.88291108608245849609375);
+        }
+        for (int i_4 = 4; i_4 < 8; i_4 += 2)
+        {
+            values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * 0.4435068666934967041015625);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active_lane)
+    {
+        for (int i_5 = 2; i_5 < 4; i_5++)
+        {
+            float2 a = values[(2 * i_5) + 0];
+            float2 b = values[(2 * i_5) + 1];
+            a *= 0.812893092632293701171875;
+            b *= 1.23017406463623046875;
+            float2 t0 = float2(a.x, b.x);
+            float2 t1 = float2(a.y, b.y);
+            int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+            uint param_2 = uint(y_coord);
+            uint param_3 = uint((2 * local_coord.y) + 0);
+            float2 param_4 = t0;
+            store_shared(param_2, param_3, param_4, shared_block);
+            uint param_5 = uint(y_coord);
+            uint param_6 = uint((2 * local_coord.y) + 1);
+            float2 param_7 = t1;
+            store_shared(param_5, param_6, param_7, shared_block);
+        }
+    }
+}
+
+kernel void pyrowave_dwt(constant Registers& _104 [[buffer(0)]], texture2d<float> uTexture [[texture(0)]], texture2d_array<float, access::write> uOutput [[texture(1)]], sampler uTextureSmplr [[sampler(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]])
+{
+    threadgroup spvUnsafeArray<spvUnsafeArray<float2, 41>, 20> shared_block;
+    uint local_index = (gl_SubgroupID * gl_SubgroupSize) + gl_SubgroupInvocationID;
+    load_image_with_apron(shared_block, _104, gl_WorkGroupID, local_index, uTexture, uTextureSmplr);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    bool param = local_index < 32u;
+    int param_1 = 16;
+    forward_transform4x2(param, param_1, shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint param_2 = local_index;
+    int2 local_coord = unswizzle8x8(param_2);
+    for (int y = local_coord.y; y < 16; y += 8)
+    {
+        int _978 = local_coord.x * 2;
+        for (int x = _978; x < 32; x += 16)
+        {
+            uint param_3 = uint(y);
+            uint param_4 = uint(x + 0);
+            float2 v0 = load_shared(param_3, param_4, shared_block);
+            uint param_5 = uint(y);
+            uint param_6 = uint(x + 1);
+            float2 v1 = load_shared(param_5, param_6, shared_block);
+            int img_x = x >> 1;
+            int img_y = y;
+            int2 base_image_coord = (int2(gl_WorkGroupID.xy) * int2(16)) + int2(img_x, img_y);
+            int3 _1027 = int3(base_image_coord, 0);
+            uOutput.write(v0.xxxx, uint2(_1027.xy), uint(_1027.z));
+            int3 _1034 = int3(base_image_coord, 2);
+            uOutput.write(v0.yyyy, uint2(_1034.xy), uint(_1034.z));
+            int3 _1041 = int3(base_image_coord, 1);
+            uOutput.write(v1.xxxx, uint2(_1041.xy), uint(_1041.z));
+            int3 _1048 = int3(base_image_coord, 3);
+            uOutput.write(v1.yyyy, uint2(_1048.xy), uint(_1048.z));
+        }
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char dwt_fp16_storage_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+struct Registers
+{
+    int2 resolution;
+    float2 inv_resolution;
+    int2 aligned_resolution;
+};
+
+constant bool DCShift_tmp [[function_constant(0)]];
+constant bool DCShift = is_function_constant_defined(DCShift_tmp) ? DCShift_tmp : false;
+
+static inline __attribute__((always_inline))
+int2 unswizzle8x8(thread const uint& index)
+{
+    uint y = extract_bits(index, uint(0), uint(1));
+    uint x = extract_bits(index, uint(1), uint(2));
+    y |= (extract_bits(index, uint(3), uint(2)) << uint(1));
+    x |= (extract_bits(index, uint(5), uint(1)) << uint(2));
+    return int2(int(x), int(y));
+}
+
+static inline __attribute__((always_inline))
+float2 generate_mirror_uv(thread int2& coord, constant Registers& _108)
+{
+    coord -= int2(coord < int2(0));
+    coord += int2(1);
+    int2 end_mirrored_clamp = (int2(2) * _108.aligned_resolution) - _108.resolution;
+    int2 past_wrapped_coord = (coord + (int2(2) * (_108.resolution - _108.aligned_resolution))) + int2(1);
+    coord = select(min(coord, _108.resolution), past_wrapped_coord, coord >= end_mirrored_clamp);
+    return float2(coord) * _108.inv_resolution;
+}
+
+static inline __attribute__((always_inline))
+void store_shared(thread const uint& y, thread const uint& x, thread const float2& v, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block)
+{
+    shared_block[y][x] = half2(v);
+}
+
+static inline __attribute__((always_inline))
+void load_image_with_apron(threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, constant Registers& _108, thread uint3& gl_WorkGroupID, thread uint& local_index, texture2d<float> uTexture, sampler uTextureSmplr)
+{
+    int2 base_coord = (int2(gl_WorkGroupID.xy) * int2(32)) - int2(4);
+    uint param = local_index;
+    int2 local_coord0 = int2(2) * unswizzle8x8(param);
+    int2 coord0 = base_coord + local_coord0;
+    int2 param_1 = coord0;
+    float2 _182 = generate_mirror_uv(param_1, _108);
+    float4 texels0 = uTexture.gather(uTextureSmplr, _182, int2(0), component::x).wzxy;
+    int2 param_2 = coord0 + int2(16, 0);
+    float2 _192 = generate_mirror_uv(param_2, _108);
+    float4 texels1 = uTexture.gather(uTextureSmplr, _192, int2(0), component::x).wzxy;
+    int2 param_3 = coord0 + int2(0, 16);
+    float2 _201 = generate_mirror_uv(param_3, _108);
+    float4 texels2 = uTexture.gather(uTextureSmplr, _201, int2(0), component::x).wzxy;
+    int2 param_4 = coord0 + int2(16);
+    float2 _210 = generate_mirror_uv(param_4, _108);
+    float4 texels3 = uTexture.gather(uTextureSmplr, _210, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels0 -= float4(0.5);
+        texels1 -= float4(0.5);
+        texels2 -= float4(0.5);
+        texels3 -= float4(0.5);
+    }
+    int local_coord0_y_half = local_coord0.y >> 1;
+    uint param_5 = uint(local_coord0_y_half + 0);
+    uint param_6 = uint(local_coord0.x + 0);
+    float2 param_7 = texels0.xz;
+    store_shared(param_5, param_6, param_7, shared_block);
+    uint param_8 = uint(local_coord0_y_half + 0);
+    uint param_9 = uint(local_coord0.x + 1);
+    float2 param_10 = texels0.yw;
+    store_shared(param_8, param_9, param_10, shared_block);
+    uint param_11 = uint(local_coord0_y_half + 0);
+    uint param_12 = uint(local_coord0.x + 16);
+    float2 param_13 = texels1.xz;
+    store_shared(param_11, param_12, param_13, shared_block);
+    uint param_14 = uint(local_coord0_y_half + 0);
+    uint param_15 = uint(local_coord0.x + 17);
+    float2 param_16 = texels1.yw;
+    store_shared(param_14, param_15, param_16, shared_block);
+    uint param_17 = uint(local_coord0_y_half + 8);
+    uint param_18 = uint(local_coord0.x + 0);
+    float2 param_19 = texels2.xz;
+    store_shared(param_17, param_18, param_19, shared_block);
+    uint param_20 = uint(local_coord0_y_half + 8);
+    uint param_21 = uint(local_coord0.x + 1);
+    float2 param_22 = texels2.yw;
+    store_shared(param_20, param_21, param_22, shared_block);
+    uint param_23 = uint(local_coord0_y_half + 8);
+    uint param_24 = uint(local_coord0.x + 16);
+    float2 param_25 = texels3.xz;
+    store_shared(param_23, param_24, param_25, shared_block);
+    uint param_26 = uint(local_coord0_y_half + 8);
+    uint param_27 = uint(local_coord0.x + 17);
+    float2 param_28 = texels3.yw;
+    store_shared(param_26, param_27, param_28, shared_block);
+    int2 local_coord = int2(int(32u + (2u * (local_index % 4u))), int(2u * (local_index / 4u)));
+    int2 param_29 = base_coord + local_coord;
+    float2 _361 = generate_mirror_uv(param_29, _108);
+    float4 texels = uTexture.gather(uTextureSmplr, _361, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels -= float4(0.5);
+    }
+    uint param_30 = uint(local_coord.y >> 1);
+    uint param_31 = uint(local_coord.x + 0);
+    float2 param_32 = texels.xz;
+    store_shared(param_30, param_31, param_32, shared_block);
+    uint param_33 = uint(local_coord.y >> 1);
+    uint param_34 = uint(local_coord.x + 1);
+    float2 param_35 = texels.yw;
+    store_shared(param_33, param_34, param_35, shared_block);
+    int2 local_coord_1 = int2(int(2u * (local_index % 16u)), int(32u + (2u * (local_index / 16u))));
+    int2 param_36 = base_coord + local_coord_1;
+    float2 _415 = generate_mirror_uv(param_36, _108);
+    float4 texels_1 = uTexture.gather(uTextureSmplr, _415, int2(0), component::x).wzxy;
+    if (DCShift)
+    {
+        texels_1 -= float4(0.5);
+    }
+    uint param_37 = uint(local_coord_1.y >> 1);
+    uint param_38 = uint(local_coord_1.x + 0);
+    float2 param_39 = texels_1.xz;
+    store_shared(param_37, param_38, param_39, shared_block);
+    uint param_40 = uint(local_coord_1.y >> 1);
+    uint param_41 = uint(local_coord_1.x + 1);
+    float2 param_42 = texels_1.yw;
+    store_shared(param_40, param_41, param_42, shared_block);
+    if (local_index < 16u)
+    {
+        int2 local_coord_2 = int2(int(32u + (2u * (local_index % 4u))), int(32u + (2u * (local_index / 4u))));
+        int2 param_43 = base_coord + local_coord_2;
+        float2 _473 = generate_mirror_uv(param_43, _108);
+        float4 texels_2 = uTexture.gather(uTextureSmplr, _473, int2(0), component::x).wzxy;
+        if (DCShift)
+        {
+            texels_2 -= float4(0.5);
+        }
+        uint param_44 = uint(local_coord_2.y >> 1);
+        uint param_45 = uint(local_coord_2.x + 0);
+        float2 param_46 = texels_2.xz;
+        store_shared(param_44, param_45, param_46, shared_block);
+        uint param_47 = uint(local_coord_2.y >> 1);
+        uint param_48 = uint(local_coord_2.x + 1);
+        float2 param_49 = texels_2.yw;
+        store_shared(param_47, param_48, param_49, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+float2 load_shared(thread const uint& y, thread const uint& x, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block)
+{
+    return float2(shared_block[y][x]);
+}
+
+static inline __attribute__((always_inline))
+void forward_transform8x2(threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(8u * (local_index % 4u)), int(local_index / 4u));
+    spvUnsafeArray<float2, 16> values;
+    for (int i = 0; i < 16; i++)
+    {
+        uint param = uint(local_coord.y);
+        uint param_1 = uint(local_coord.x + i);
+        float2 v = load_shared(param, param_1, shared_block);
+        values[i] = v;
+    }
+    for (int i_1 = 1; i_1 < 15; i_1 += 2)
+    {
+        values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * (-1.58613431453704833984375));
+    }
+    for (int i_2 = 2; i_2 < 14; i_2 += 2)
+    {
+        values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * (-0.052980117499828338623046875));
+    }
+    for (int i_3 = 3; i_3 < 13; i_3 += 2)
+    {
+        values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * 0.88291108608245849609375);
+    }
+    for (int i_4 = 4; i_4 < 12; i_4 += 2)
+    {
+        values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * 0.4435068666934967041015625);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i_5 = 2; i_5 < 6; i_5++)
+    {
+        float2 a = values[(2 * i_5) + 0];
+        float2 b = values[(2 * i_5) + 1];
+        a *= 0.812893092632293701171875;
+        b *= 1.23017406463623046875;
+        float2 t0 = float2(a.x, b.x);
+        float2 t1 = float2(a.y, b.y);
+        int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+        uint param_2 = uint(y_coord);
+        uint param_3 = uint((2 * local_coord.y) + 0);
+        float2 param_4 = t0;
+        store_shared(param_2, param_3, param_4, shared_block);
+        uint param_5 = uint(y_coord);
+        uint param_6 = uint((2 * local_coord.y) + 1);
+        float2 param_7 = t1;
+        store_shared(param_5, param_6, param_7, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+void forward_transform4x2(thread const bool& active_lane, thread const int& y_offset, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(4u * (local_index % 8u)), int((local_index / 8u) + uint(y_offset)));
+    spvUnsafeArray<float2, 12> values;
+    if (active_lane)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            uint param = uint(local_coord.y);
+            uint param_1 = uint(local_coord.x + i);
+            float2 v = load_shared(param, param_1, shared_block);
+            values[i] = v;
+        }
+        for (int i_1 = 1; i_1 < 11; i_1 += 2)
+        {
+            values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * (-1.58613431453704833984375));
+        }
+        for (int i_2 = 2; i_2 < 10; i_2 += 2)
+        {
+            values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * (-0.052980117499828338623046875));
+        }
+        for (int i_3 = 3; i_3 < 9; i_3 += 2)
+        {
+            values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * 0.88291108608245849609375);
+        }
+        for (int i_4 = 4; i_4 < 8; i_4 += 2)
+        {
+            values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * 0.4435068666934967041015625);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active_lane)
+    {
+        for (int i_5 = 2; i_5 < 4; i_5++)
+        {
+            float2 a = values[(2 * i_5) + 0];
+            float2 b = values[(2 * i_5) + 1];
+            a *= 0.812893092632293701171875;
+            b *= 1.23017406463623046875;
+            float2 t0 = float2(a.x, b.x);
+            float2 t1 = float2(a.y, b.y);
+            int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+            uint param_2 = uint(y_coord);
+            uint param_3 = uint((2 * local_coord.y) + 0);
+            float2 param_4 = t0;
+            store_shared(param_2, param_3, param_4, shared_block);
+            uint param_5 = uint(y_coord);
+            uint param_6 = uint((2 * local_coord.y) + 1);
+            float2 param_7 = t1;
+            store_shared(param_5, param_6, param_7, shared_block);
+        }
+    }
+}
+
+kernel void pyrowave_dwt(constant Registers& _108 [[buffer(0)]], texture2d<float> uTexture [[texture(0)]], texture2d_array<float, access::write> uOutput [[texture(1)]], sampler uTextureSmplr [[sampler(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]])
+{
+    threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20> shared_block;
+    uint local_index = (gl_SubgroupID * gl_SubgroupSize) + gl_SubgroupInvocationID;
+    load_image_with_apron(shared_block, _108, gl_WorkGroupID, local_index, uTexture, uTextureSmplr);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    bool param = local_index < 32u;
+    int param_1 = 16;
+    forward_transform4x2(param, param_1, shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint param_2 = local_index;
+    int2 local_coord = unswizzle8x8(param_2);
+    for (int y = local_coord.y; y < 16; y += 8)
+    {
+        int _982 = local_coord.x * 2;
+        for (int x = _982; x < 32; x += 16)
+        {
+            uint param_3 = uint(y);
+            uint param_4 = uint(x + 0);
+            float2 v0 = load_shared(param_3, param_4, shared_block);
+            uint param_5 = uint(y);
+            uint param_6 = uint(x + 1);
+            float2 v1 = load_shared(param_5, param_6, shared_block);
+            int img_x = x >> 1;
+            int img_y = y;
+            int2 base_image_coord = (int2(gl_WorkGroupID.xy) * int2(16)) + int2(img_x, img_y);
+            int3 _1031 = int3(base_image_coord, 0);
+            uOutput.write(v0.xxxx, uint2(_1031.xy), uint(_1031.z));
+            int3 _1038 = int3(base_image_coord, 2);
+            uOutput.write(v0.yyyy, uint2(_1038.xy), uint(_1038.z));
+            int3 _1045 = int3(base_image_coord, 1);
+            uOutput.write(v1.xxxx, uint2(_1045.xy), uint(_1045.z));
+            int3 _1052 = int3(base_image_coord, 3);
+            uOutput.write(v1.yyyy, uint2(_1052.xy), uint(_1052.z));
+        }
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char dwt_fp16_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+struct Registers
+{
+    int2 resolution;
+    float2 inv_resolution;
+    int2 aligned_resolution;
+};
+
+constant bool DCShift_tmp [[function_constant(0)]];
+constant bool DCShift = is_function_constant_defined(DCShift_tmp) ? DCShift_tmp : false;
+
+static inline __attribute__((always_inline))
+int2 unswizzle8x8(thread const uint& index)
+{
+    uint y = extract_bits(index, uint(0), uint(1));
+    uint x = extract_bits(index, uint(1), uint(2));
+    y |= (extract_bits(index, uint(3), uint(2)) << uint(1));
+    x |= (extract_bits(index, uint(5), uint(1)) << uint(2));
+    return int2(int(x), int(y));
+}
+
+static inline __attribute__((always_inline))
+float2 generate_mirror_uv(thread int2& coord, constant Registers& _106)
+{
+    coord -= int2(coord < int2(0));
+    coord += int2(1);
+    int2 end_mirrored_clamp = (int2(2) * _106.aligned_resolution) - _106.resolution;
+    int2 past_wrapped_coord = (coord + (int2(2) * (_106.resolution - _106.aligned_resolution))) + int2(1);
+    coord = select(min(coord, _106.resolution), past_wrapped_coord, coord >= end_mirrored_clamp);
+    return float2(coord) * _106.inv_resolution;
+}
+
+static inline __attribute__((always_inline))
+void store_shared(thread const uint& y, thread const uint& x, thread const half2& v, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block)
+{
+    shared_block[y][x] = v;
+}
+
+static inline __attribute__((always_inline))
+void load_image_with_apron(threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, constant Registers& _106, thread uint3& gl_WorkGroupID, thread uint& local_index, texture2d<float> uTexture, sampler uTextureSmplr)
+{
+    int2 base_coord = (int2(gl_WorkGroupID.xy) * int2(32)) - int2(4);
+    uint param = local_index;
+    int2 local_coord0 = int2(2) * unswizzle8x8(param);
+    int2 coord0 = base_coord + local_coord0;
+    int2 param_1 = coord0;
+    float2 _180 = generate_mirror_uv(param_1, _106);
+    half4 texels0 = half4(uTexture.gather(uTextureSmplr, _180, int2(0), component::x)).wzxy;
+    int2 param_2 = coord0 + int2(16, 0);
+    float2 _192 = generate_mirror_uv(param_2, _106);
+    half4 texels1 = half4(uTexture.gather(uTextureSmplr, _192, int2(0), component::x)).wzxy;
+    int2 param_3 = coord0 + int2(0, 16);
+    float2 _202 = generate_mirror_uv(param_3, _106);
+    half4 texels2 = half4(uTexture.gather(uTextureSmplr, _202, int2(0), component::x)).wzxy;
+    int2 param_4 = coord0 + int2(16);
+    float2 _212 = generate_mirror_uv(param_4, _106);
+    half4 texels3 = half4(uTexture.gather(uTextureSmplr, _212, int2(0), component::x)).wzxy;
+    if (DCShift)
+    {
+        texels0 -= half4(half(0.5));
+        texels1 -= half4(half(0.5));
+        texels2 -= half4(half(0.5));
+        texels3 -= half4(half(0.5));
+    }
+    int local_coord0_y_half = local_coord0.y >> 1;
+    uint param_5 = uint(local_coord0_y_half + 0);
+    uint param_6 = uint(local_coord0.x + 0);
+    half2 param_7 = texels0.xz;
+    store_shared(param_5, param_6, param_7, shared_block);
+    uint param_8 = uint(local_coord0_y_half + 0);
+    uint param_9 = uint(local_coord0.x + 1);
+    half2 param_10 = texels0.yw;
+    store_shared(param_8, param_9, param_10, shared_block);
+    uint param_11 = uint(local_coord0_y_half + 0);
+    uint param_12 = uint(local_coord0.x + 16);
+    half2 param_13 = texels1.xz;
+    store_shared(param_11, param_12, param_13, shared_block);
+    uint param_14 = uint(local_coord0_y_half + 0);
+    uint param_15 = uint(local_coord0.x + 17);
+    half2 param_16 = texels1.yw;
+    store_shared(param_14, param_15, param_16, shared_block);
+    uint param_17 = uint(local_coord0_y_half + 8);
+    uint param_18 = uint(local_coord0.x + 0);
+    half2 param_19 = texels2.xz;
+    store_shared(param_17, param_18, param_19, shared_block);
+    uint param_20 = uint(local_coord0_y_half + 8);
+    uint param_21 = uint(local_coord0.x + 1);
+    half2 param_22 = texels2.yw;
+    store_shared(param_20, param_21, param_22, shared_block);
+    uint param_23 = uint(local_coord0_y_half + 8);
+    uint param_24 = uint(local_coord0.x + 16);
+    half2 param_25 = texels3.xz;
+    store_shared(param_23, param_24, param_25, shared_block);
+    uint param_26 = uint(local_coord0_y_half + 8);
+    uint param_27 = uint(local_coord0.x + 17);
+    half2 param_28 = texels3.yw;
+    store_shared(param_26, param_27, param_28, shared_block);
+    int2 local_coord = int2(int(32u + (2u * (local_index % 4u))), int(2u * (local_index / 4u)));
+    int2 param_29 = base_coord + local_coord;
+    float2 _364 = generate_mirror_uv(param_29, _106);
+    half4 texels = half4(uTexture.gather(uTextureSmplr, _364, int2(0), component::x)).wzxy;
+    if (DCShift)
+    {
+        texels -= half4(half(0.5));
+    }
+    uint param_30 = uint(local_coord.y >> 1);
+    uint param_31 = uint(local_coord.x + 0);
+    half2 param_32 = texels.xz;
+    store_shared(param_30, param_31, param_32, shared_block);
+    uint param_33 = uint(local_coord.y >> 1);
+    uint param_34 = uint(local_coord.x + 1);
+    half2 param_35 = texels.yw;
+    store_shared(param_33, param_34, param_35, shared_block);
+    int2 local_coord_1 = int2(int(2u * (local_index % 16u)), int(32u + (2u * (local_index / 16u))));
+    int2 param_36 = base_coord + local_coord_1;
+    float2 _419 = generate_mirror_uv(param_36, _106);
+    half4 texels_1 = half4(uTexture.gather(uTextureSmplr, _419, int2(0), component::x)).wzxy;
+    if (DCShift)
+    {
+        texels_1 -= half4(half(0.5));
+    }
+    uint param_37 = uint(local_coord_1.y >> 1);
+    uint param_38 = uint(local_coord_1.x + 0);
+    half2 param_39 = texels_1.xz;
+    store_shared(param_37, param_38, param_39, shared_block);
+    uint param_40 = uint(local_coord_1.y >> 1);
+    uint param_41 = uint(local_coord_1.x + 1);
+    half2 param_42 = texels_1.yw;
+    store_shared(param_40, param_41, param_42, shared_block);
+    if (local_index < 16u)
+    {
+        int2 local_coord_2 = int2(int(32u + (2u * (local_index % 4u))), int(32u + (2u * (local_index / 4u))));
+        int2 param_43 = base_coord + local_coord_2;
+        float2 _478 = generate_mirror_uv(param_43, _106);
+        half4 texels_2 = half4(uTexture.gather(uTextureSmplr, _478, int2(0), component::x)).wzxy;
+        if (DCShift)
+        {
+            texels_2 -= half4(half(0.5));
+        }
+        uint param_44 = uint(local_coord_2.y >> 1);
+        uint param_45 = uint(local_coord_2.x + 0);
+        half2 param_46 = texels_2.xz;
+        store_shared(param_44, param_45, param_46, shared_block);
+        uint param_47 = uint(local_coord_2.y >> 1);
+        uint param_48 = uint(local_coord_2.x + 1);
+        half2 param_49 = texels_2.yw;
+        store_shared(param_47, param_48, param_49, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+half2 load_shared(thread const uint& y, thread const uint& x, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block)
+{
+    return shared_block[y][x];
+}
+
+static inline __attribute__((always_inline))
+void forward_transform8x2(threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(8u * (local_index % 4u)), int(local_index / 4u));
+    spvUnsafeArray<half2, 16> values;
+    for (int i = 0; i < 16; i++)
+    {
+        uint param = uint(local_coord.y);
+        uint param_1 = uint(local_coord.x + i);
+        half2 v = load_shared(param, param_1, shared_block);
+        values[i] = v;
+    }
+    for (int i_1 = 1; i_1 < 15; i_1 += 2)
+    {
+        values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * half(-1.5859375));
+    }
+    for (int i_2 = 2; i_2 < 14; i_2 += 2)
+    {
+        values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * half(-0.052978515625));
+    }
+    for (int i_3 = 3; i_3 < 13; i_3 += 2)
+    {
+        values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * half(0.8828125));
+    }
+    for (int i_4 = 4; i_4 < 12; i_4 += 2)
+    {
+        values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * half(0.443359375));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i_5 = 2; i_5 < 6; i_5++)
+    {
+        half2 a = values[(2 * i_5) + 0];
+        half2 b = values[(2 * i_5) + 1];
+        a *= half(0.8125);
+        b *= half(1.2294921875);
+        half2 t0 = half2(a.x, b.x);
+        half2 t1 = half2(a.y, b.y);
+        int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+        uint param_2 = uint(y_coord);
+        uint param_3 = uint((2 * local_coord.y) + 0);
+        half2 param_4 = t0;
+        store_shared(param_2, param_3, param_4, shared_block);
+        uint param_5 = uint(y_coord);
+        uint param_6 = uint((2 * local_coord.y) + 1);
+        half2 param_7 = t1;
+        store_shared(param_5, param_6, param_7, shared_block);
+    }
+}
+
+static inline __attribute__((always_inline))
+void forward_transform4x2(thread const bool& active_lane, thread const int& y_offset, threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20>& shared_block, thread uint& local_index)
+{
+    int2 local_coord = int2(int(4u * (local_index % 8u)), int((local_index / 8u) + uint(y_offset)));
+    spvUnsafeArray<half2, 12> values;
+    if (active_lane)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            uint param = uint(local_coord.y);
+            uint param_1 = uint(local_coord.x + i);
+            half2 v = load_shared(param, param_1, shared_block);
+            values[i] = v;
+        }
+        for (int i_1 = 1; i_1 < 11; i_1 += 2)
+        {
+            values[i_1] += ((values[i_1 - 1] + values[i_1 + 1]) * half(-1.5859375));
+        }
+        for (int i_2 = 2; i_2 < 10; i_2 += 2)
+        {
+            values[i_2] += ((values[i_2 - 1] + values[i_2 + 1]) * half(-0.052978515625));
+        }
+        for (int i_3 = 3; i_3 < 9; i_3 += 2)
+        {
+            values[i_3] += ((values[i_3 - 1] + values[i_3 + 1]) * half(0.8828125));
+        }
+        for (int i_4 = 4; i_4 < 8; i_4 += 2)
+        {
+            values[i_4] += ((values[i_4 - 1] + values[i_4 + 1]) * half(0.443359375));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (active_lane)
+    {
+        for (int i_5 = 2; i_5 < 4; i_5++)
+        {
+            half2 a = values[(2 * i_5) + 0];
+            half2 b = values[(2 * i_5) + 1];
+            a *= half(0.8125);
+            b *= half(1.2294921875);
+            half2 t0 = half2(a.x, b.x);
+            half2 t1 = half2(a.y, b.y);
+            int y_coord = (local_coord.x >> 1) + (i_5 - 2);
+            uint param_2 = uint(y_coord);
+            uint param_3 = uint((2 * local_coord.y) + 0);
+            half2 param_4 = t0;
+            store_shared(param_2, param_3, param_4, shared_block);
+            uint param_5 = uint(y_coord);
+            uint param_6 = uint((2 * local_coord.y) + 1);
+            half2 param_7 = t1;
+            store_shared(param_5, param_6, param_7, shared_block);
+        }
+    }
+}
+
+kernel void pyrowave_dwt(constant Registers& _106 [[buffer(0)]], texture2d<float> uTexture [[texture(0)]], texture2d_array<float, access::write> uOutput [[texture(1)]], sampler uTextureSmplr [[sampler(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]])
+{
+    threadgroup spvUnsafeArray<spvUnsafeArray<half2, 41>, 20> shared_block;
+    uint local_index = (gl_SubgroupID * gl_SubgroupSize) + gl_SubgroupInvocationID;
+    load_image_with_apron(shared_block, _106, gl_WorkGroupID, local_index, uTexture, uTextureSmplr);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    bool param = local_index < 32u;
+    int param_1 = 16;
+    forward_transform4x2(param, param_1, shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    forward_transform8x2(shared_block, local_index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint param_2 = local_index;
+    int2 local_coord = unswizzle8x8(param_2);
+    for (int y = local_coord.y; y < 16; y += 8)
+    {
+        int _988 = local_coord.x * 2;
+        for (int x = _988; x < 32; x += 16)
+        {
+            uint param_3 = uint(y);
+            uint param_4 = uint(x + 0);
+            half2 v0 = load_shared(param_3, param_4, shared_block);
+            uint param_5 = uint(y);
+            uint param_6 = uint(x + 1);
+            half2 v1 = load_shared(param_5, param_6, shared_block);
+            int img_x = x >> 1;
+            int img_y = y;
+            int2 base_image_coord = (int2(gl_WorkGroupID.xy) * int2(16)) + int2(img_x, img_y);
+            int3 _1037 = int3(base_image_coord, 0);
+            uOutput.write(float4(v0.xxxx), uint2(_1037.xy), uint(_1037.z));
+            int3 _1045 = int3(base_image_coord, 2);
+            uOutput.write(float4(v0.yyyy), uint2(_1045.xy), uint(_1045.z));
+            int3 _1053 = int3(base_image_coord, 1);
+            uOutput.write(float4(v1.xxxx), uint2(_1053.xy), uint(_1053.z));
+            int3 _1061 = int3(base_image_coord, 3);
+            uOutput.write(float4(v1.yyyy), uint2(_1061.xy), uint(_1061.z));
+        }
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char wavelet_quant_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+// Implementation of the signed GLSL findMSB() function
+template<typename T>
+inline T spvFindSMSB(T x)
+{
+    T v = select(x, T(-1) - x, x < T(0));
+    return select(clz(T(0)) - (clz(v) + T(1)), T(-1), v == T(0));
+}
+
+template<typename T>
+[[clang::optnone]] T spvFMul(T l, T r)
+{
+    return fma(l, r, T(0));
+}
+
+template<typename T, int Cols, int Rows>
+[[clang::optnone]] vec<T, Cols> spvFMulVectorMatrix(vec<T, Rows> v, matrix<T, Cols, Rows> m)
+{
+    vec<T, Cols> res = vec<T, Cols>(0);
+    for (uint i = Rows; i > 0; --i)
+    {
+        vec<T, Cols> tmp(0);
+        for (uint j = 0; j < Cols; ++j)
+        {
+            tmp[j] = m[j][i - 1];
+        }
+        res = fma(tmp, vec<T, Cols>(v[i - 1]), res);
+    }
+    return res;
+}
+
+template<typename T, int Cols, int Rows>
+[[clang::optnone]] vec<T, Rows> spvFMulMatrixVector(matrix<T, Cols, Rows> m, vec<T, Cols> v)
+{
+    vec<T, Rows> res = vec<T, Rows>(0);
+    for (uint i = Cols; i > 0; --i)
+    {
+        res = fma(m[i - 1], vec<T, Rows>(v[i - 1]), res);
+    }
+    return res;
+}
+
+template<typename T, int LCols, int LRows, int RCols, int RRows>
+[[clang::optnone]] matrix<T, RCols, LRows> spvFMulMatrixMatrix(matrix<T, LCols, LRows> l, matrix<T, RCols, RRows> r)
+{
+    matrix<T, RCols, LRows> res;
+    for (uint i = 0; i < RCols; i++)
+    {
+        vec<T, RCols> tmp(0);
+        for (uint j = 0; j < LCols; j++)
+        {
+            tmp = fma(vec<T, RCols>(r[i][j]), l[j], tmp);
+        }
+        res[i] = tmp;
+    }
+    return res;
+}
+
+template<typename T>
+inline T spvSubgroupShuffle(T value, ushort lane)
+{
+    return simd_shuffle(value, lane);
+}
+
+template<>
+inline bool spvSubgroupShuffle(bool value, ushort lane)
+{
+    return !!simd_shuffle((ushort)value, lane);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffle(vec<bool, N> value, ushort lane)
+{
+    return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, lane);
+}
+
+template<>
+inline ulong spvSubgroupShuffle(ulong value, ushort lane)
+{
+    return as_type<ulong>(spvSubgroupShuffle(as_type<uint2>(value), lane));
+}
+
+template<>
+inline ulong2 spvSubgroupShuffle(ulong2 value, ushort lane)
+{
+    return ulong2(spvSubgroupShuffle(value.x, lane), spvSubgroupShuffle(value.y, lane));
+}
+
+inline ulong3 spvSubgroupShuffle(ulong3 value, ushort lane)
+{
+    return ulong3(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.z, lane));
+}
+
+inline ulong4 spvSubgroupShuffle(ulong4 value, ushort lane)
+{
+    return ulong4(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.zw, lane));
+}
+
+template<uint N>
+inline vec<long, N> spvSubgroupShuffle(vec<long, N> value, ushort lane)
+{
+    return vec<long, N>(spvSubgroupShuffle(vec<ulong, N>(value), lane));
+}
+
+template<typename T>
+inline T spvSubgroupShuffleXor(T value, ushort mask)
+{
+    return simd_shuffle_xor(value, mask);
+}
+
+template<>
+inline bool spvSubgroupShuffleXor(bool value, ushort mask)
+{
+    return !!simd_shuffle_xor((ushort)value, mask);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffleXor(vec<bool, N> value, ushort mask)
+{
+    return (vec<bool, N>)simd_shuffle_xor((vec<ushort, N>)value, mask);
+}
+
+template<typename T>
+inline T spvSubgroupShuffleUp(T value, ushort delta)
+{
+    return simd_shuffle_up(value, delta);
+}
+
+template<>
+inline bool spvSubgroupShuffleUp(bool value, ushort delta)
+{
+    return !!simd_shuffle_up((ushort)value, delta);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffleUp(vec<bool, N> value, ushort delta)
+{
+    return (vec<bool, N>)simd_shuffle_up((vec<ushort, N>)value, delta);
+}
+
+template<uint N, uint offset>
+struct spvClusteredAddDetail;
+
+// Base cases
+template<>
+struct spvClusteredAddDetail<1, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return value;
+    }
+};
+
+template<uint offset>
+struct spvClusteredAddDetail<1, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // If the target lane is inactive, then return identity.
+        if (!extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], (lid ^ offset) % 32, 1))
+            return 0;
+        return simd_shuffle_xor(value, offset);
+    }
+};
+
+template<>
+struct spvClusteredAddDetail<4, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return quad_sum(value);
+    }
+};
+
+template<uint offset>
+struct spvClusteredAddDetail<4, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // Here, we care if any of the lanes in the quad are active.
+        uint quad_mask = extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], ((lid ^ offset) % 32) & ~3, 4);
+        if (!quad_mask)
+            return 0;
+        // But we need to make sure we shuffle from an active lane.
+        return simd_shuffle(quad_sum(value), ((lid ^ offset) & ~3) | ctz(quad_mask));
+    }
+};
+
+// General case
+template<uint N, uint offset>
+struct spvClusteredAddDetail
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        return spvClusteredAddDetail<N/2, offset>::op(value, lid) + spvClusteredAddDetail<N/2, offset + N/2>::op(value, lid);
+    }
+};
+
+template<uint N, typename T>
+T spvClustered_sum(T value, uint lid)
+{
+    return spvClusteredAddDetail<N, 0>::op(value, lid);
+}
+
+template<uint N, uint offset>
+struct spvClusteredMaxDetail;
+
+// Base cases
+template<>
+struct spvClusteredMaxDetail<1, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return value;
+    }
+};
+
+template<uint offset>
+struct spvClusteredMaxDetail<1, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // If the target lane is inactive, then return identity.
+        if (!extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], (lid ^ offset) % 32, 1))
+            return numeric_limits<T>::min();
+        return simd_shuffle_xor(value, offset);
+    }
+};
+
+template<>
+struct spvClusteredMaxDetail<4, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return quad_max(value);
+    }
+};
+
+template<uint offset>
+struct spvClusteredMaxDetail<4, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // Here, we care if any of the lanes in the quad are active.
+        uint quad_mask = extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], ((lid ^ offset) % 32) & ~3, 4);
+        if (!quad_mask)
+            return numeric_limits<T>::min();
+        // But we need to make sure we shuffle from an active lane.
+        return simd_shuffle(quad_max(value), ((lid ^ offset) & ~3) | ctz(quad_mask));
+    }
+};
+
+// General case
+template<uint N, uint offset>
+struct spvClusteredMaxDetail
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        return max(spvClusteredMaxDetail<N/2, offset>::op(value, lid), spvClusteredMaxDetail<N/2, offset + N/2>::op(value, lid));
+    }
+};
+
+template<uint N, typename T>
+T spvClustered_max(T value, uint lid)
+{
+    return spvClusteredMaxDetail<N, 0>::op(value, lid);
+}
+
+struct QuantResult
+{
+    float square_error;
+    int encode_cost_early;
+    int block4x2_shifted;
+    int encode_cost_late_bits;
+    int quality_planes;
+};
+
+constant bool SkipQuantScale_tmp [[function_constant(1)]];
+constant bool SkipQuantScale = is_function_constant_defined(SkipQuantScale_tmp) ? SkipQuantScale_tmp : false;
+
+struct ResType
+{
+    float _m0;
+    int _m1;
+};
+
+struct Registers
+{
+    int2 resolution;
+    int2 resolution_8x8_blocks;
+    float2 inv_resolution;
+    float input_layer;
+    float quant_resolution;
+    int block_offset;
+    int block_stride;
+    float rdo_distortion_scale;
+};
+
+struct BlockMeta
+{
+    uint code_word;
+    uint offset;
+};
+
+struct SSBOMeta
+{
+    BlockMeta meta[1];
+};
+
+struct BlockMeta_1
+{
+    uint code_word;
+    uint offset;
+};
+
+struct QuantStats
+{
+    half square_error;
+    ushort payload_cost;
+};
+
+struct BlockStats
+{
+    uint num_planes;
+    QuantStats errors[15];
+};
+
+struct SSBOBlockStats
+{
+    BlockStats stats[1];
+};
+
+struct QuantStats_1
+{
+    half square_error;
+    ushort payload_cost;
+};
+
+struct Payloads
+{
+    uint counter;
+    char _m1_pad[4];
+    uchar data[1];
+};
+
+static inline __attribute__((always_inline))
+int2 unswizzle8x8(thread const uint& index)
+{
+    uint y = extract_bits(index, uint(0), uint(1));
+    uint x = extract_bits(index, uint(1), uint(2));
+    y |= (extract_bits(index, uint(3), uint(2)) << uint(1));
+    x |= (extract_bits(index, uint(5), uint(1)) << uint(2));
+    return int2(int(x), int(y));
+}
+
+static inline __attribute__((always_inline))
+float max4(thread const float4& v)
+{
+    float2 v2 = fast::max(v.xy, v.zw);
+    return fast::max(v2.x, v2.y);
+}
+
+static inline __attribute__((always_inline))
+uint encode_quant_scale(thread const float& scale)
+{
+    return uint(ceil((scale - 0.25) * 8.0));
+}
+
+static inline __attribute__((always_inline))
+float decode_quant_scale(thread const uint& code)
+{
+    return (float(code) / 8.0) + 0.25;
+}
+
+static inline __attribute__((always_inline))
+void compute_quant_scale(thread const float& max_wave_texels, thread uint& quant_code, thread float& quant_scale)
+{
+    if (SkipQuantScale || (max_wave_texels < 1.0))
+    {
+        quant_code = 6u;
+        quant_scale = 1.0;
+    }
+    else
+    {
+        ResType _169;
+        _169._m0 = frexp(max_wave_texels - 0.25, _169._m1);
+        int e = _169._m1;
+        float target_max = float(1 << e) - 0.25;
+        float inv_scale = max_wave_texels / target_max;
+        float param = inv_scale;
+        quant_code = encode_quant_scale(param);
+        uint param_1 = quant_code;
+        quant_scale = 1.0 / decode_quant_scale(param_1);
+    }
+}
+
+static inline __attribute__((always_inline))
+float compute_square_error(thread float2x4& v, thread const int& q, thread uint& num_significant_values, thread uint& gl_SubgroupInvocationID, constant Registers& registers)
+{
+    v = float2x4(float4(abs(v[0])), float4(abs(v[1])));
+    float2x4 iv = float2x4(float4(floor(ldexp(v[0], int4(-q)))), float4(trunc(ldexp(v[1], int4(-q)))));
+    num_significant_values = 0u;
+    for (int j = 0; j < 2; j++)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            if (iv[j][i] != 0.0)
+            {
+                num_significant_values++;
+            }
+        }
+    }
+    iv[0] += select(float4(0.0), float4(0.5), iv[0] != float4(0.0));
+    iv[1] += select(float4(0.0), float4(0.5), iv[1] != float4(0.0));
+    iv = float2x4(float4(trunc(ldexp(iv[0], int4(q)))), float4(trunc(ldexp(iv[1], int4(q)))));
+    float2x4 err = float2x4(v[0] - iv[0], v[1] - iv[1]);
+    num_significant_values = spvClustered_sum<8>(num_significant_values, gl_SubgroupInvocationID);
+    return (dot(err[0], err[0]) + dot(err[1], err[1])) * registers.rdo_distortion_scale;
+}
+
+static inline __attribute__((always_inline))
+QuantResult compute_quant_stats(thread const float2x4& v, thread const int& q, thread int& msb, thread int& block4x2_max, thread const float& inv_quant_squared, thread uint& gl_SubgroupInvocationID, constant Registers& registers)
+{
+    block4x2_max = block4x2_max >> q;
+    float2x4 param = v;
+    int param_1 = q;
+    uint param_2;
+    float _350 = compute_square_error(param, param_1, param_2, gl_SubgroupInvocationID, registers);
+    uint wave8_num_significants = param_2;
+    QuantResult result;
+    result.square_error = _350 * inv_quant_squared;
+    result.block4x2_shifted = block4x2_max;
+    result.encode_cost_early = int(block4x2_max > 0);
+    msb -= q;
+    result.quality_planes = 0;
+    if (msb >= 3)
+    {
+        result.quality_planes = msb - 2;
+        result.encode_cost_early = result.quality_planes + 1;
+        result.block4x2_shifted = result.block4x2_shifted >> result.quality_planes;
+    }
+    result.encode_cost_early += (spvFindSMSB(result.block4x2_shifted) + 1);
+    result.encode_cost_late_bits = (8 * spvClustered_sum<8>(max((result.encode_cost_early - 1), 0), gl_SubgroupInvocationID)) + int(wave8_num_significants);
+    return result;
+}
+
+static inline __attribute__((always_inline))
+int scan_clustered8(thread int& v, thread uint& gl_SubgroupInvocationID)
+{
+    for (uint i = 1u; i < 8u; i *= 2u)
+    {
+        int up = spvSubgroupShuffleUp(v, i);
+        v += (((gl_SubgroupInvocationID & 7u) >= i) ? up : 0);
+    }
+    return v;
+}
+
+static inline __attribute__((always_inline))
+void encode_payload(thread const int2& block_index_8x8, thread float2x4& texels, thread uint& gl_SubgroupInvocationID, constant Registers& registers, device SSBOMeta& block_meta, device SSBOBlockStats& block_stats, device Payloads& payload_data)
+{
+    float4 param = abs(texels[0]);
+    float4 param_1 = abs(texels[1]);
+    float max_subblock_texel = fast::max(max4(param), max4(param_1));
+    float max_wave_texels = spvClustered_max<8>(max_subblock_texel, gl_SubgroupInvocationID);
+    float param_2 = max_wave_texels;
+    uint param_3;
+    float param_4;
+    compute_quant_scale(param_2, param_3, param_4);
+    uint quant_code = param_3;
+    float quant_scale = param_4;
+    texels = texels * quant_scale;
+    max_wave_texels = spvFMul(max_wave_texels, quant_scale);
+    max_subblock_texel = spvFMul(max_subblock_texel, quant_scale);
+    float overall_quant_scale = registers.quant_resolution * quant_scale;
+    float inv_quant = 1.0 / overall_quant_scale;
+    float inv_quant_squared = inv_quant * inv_quant;
+    int4 abs_quant_texels0 = abs(int4(texels[0]));
+    int4 abs_quant_texels1 = abs(int4(texels[1]));
+    int max_absolute_value = int(max_wave_texels);
+    int block4x2_max = int(max_subblock_texel);
+    uint block_index = uint((registers.block_offset + (block_index_8x8.y * registers.block_stride)) + block_index_8x8.x);
+    if (max_absolute_value == 0)
+    {
+        if ((gl_SubgroupInvocationID & 7u) == 0u)
+        {
+            BlockMeta _500;
+            _500.code_word = (BlockMeta_1{ 0u, 0u }).code_word;
+            _500.offset = (BlockMeta_1{ 0u, 0u }).offset;
+            block_meta.meta[block_index] = _500;
+            block_stats.stats[block_index].num_planes = 0u;
+            QuantStats _521;
+            _521.square_error = (QuantStats_1{ half(0.0), ushort(0) }).square_error;
+            _521.payload_cost = (QuantStats_1{ half(0.0), ushort(0) }).payload_cost;
+            block_stats.stats[block_index].errors[0] = _521;
+        }
+        return;
+    }
+    int msb = spvFindSMSB(max_absolute_value);
+    float2x4 param_5 = texels;
+    int param_6 = 0;
+    int param_7 = msb;
+    int param_8 = block4x2_max;
+    float param_9 = inv_quant_squared;
+    QuantResult _536 = compute_quant_stats(param_5, param_6, param_7, param_8, param_9, gl_SubgroupInvocationID, registers);
+    QuantResult result = _536;
+    int param_10 = result.encode_cost_early;
+    int _541 = scan_clustered8(param_10, gl_SubgroupInvocationID);
+    int scan = _541;
+    uint global_offset = 0u;
+    if ((gl_SubgroupInvocationID & 7u) == 7u)
+    {
+        uint _556 = atomic_fetch_add_explicit((device atomic_uint*)&payload_data.counter, uint(scan), memory_order_relaxed);
+        global_offset = _556;
+    }
+    global_offset = spvSubgroupShuffle(global_offset, gl_SubgroupInvocationID | 7u);
+    scan -= result.encode_cost_early;
+    int quality_planes = result.quality_planes;
+    uint code_word = uint(quality_planes << 16);
+    code_word = insert_bits(code_word, quant_code, uint(20), uint(4));
+    uint plane_code = uint(spvFindSMSB(result.block4x2_shifted) + 1);
+    uint merged_plane_code = plane_code << ((gl_SubgroupInvocationID & 7u) * 2u);
+    merged_plane_code |= spvSubgroupShuffleXor(merged_plane_code, 1u);
+    merged_plane_code |= spvSubgroupShuffleXor(merged_plane_code, 2u);
+    merged_plane_code |= spvSubgroupShuffleXor(merged_plane_code, 4u);
+    code_word |= merged_plane_code;
+    if ((gl_SubgroupInvocationID & 7u) == 0u)
+    {
+        BlockMeta_1 _613 = BlockMeta_1{ code_word, global_offset };
+        BlockMeta _615;
+        _615.code_word = _613.code_word;
+        _615.offset = _613.offset;
+        block_meta.meta[block_index] = _615;
+        block_stats.stats[block_index].num_planes = uint(msb + 1);
+        QuantStats_1 _627 = QuantStats_1{ half(0.0), ushort(short(result.encode_cost_late_bits)) };
+        QuantStats _629;
+        _629.square_error = _627.square_error;
+        _629.payload_cost = _627.payload_cost;
+        block_stats.stats[block_index].errors[0] = _629;
+    }
+    for (int q = 1; q <= msb; q++)
+    {
+        float2x4 param_11 = texels;
+        int param_12 = q;
+        int param_13 = msb;
+        int param_14 = block4x2_max;
+        float param_15 = inv_quant_squared;
+        QuantResult _650 = compute_quant_stats(param_11, param_12, param_13, param_14, param_15, gl_SubgroupInvocationID, registers);
+        QuantResult quant_result = _650;
+        float square_error = spvClustered_sum<8>(quant_result.square_error, gl_SubgroupInvocationID);
+        if ((gl_SubgroupInvocationID & 7u) == 0u)
+        {
+            QuantStats_1 _670 = QuantStats_1{ half(fast::min(square_error, 60000.0)), ushort(short(quant_result.encode_cost_late_bits)) };
+            QuantStats _672;
+            _672.square_error = _670.square_error;
+            _672.payload_cost = _670.payload_cost;
+            block_stats.stats[block_index].errors[q] = _672;
+        }
+    }
+    float square_error_1 = spvClustered_sum<8>((dot(texels[0], texels[0]) + dot(texels[1], texels[1])) * inv_quant_squared, gl_SubgroupInvocationID);
+    if ((gl_SubgroupInvocationID & 7u) == 0u)
+    {
+        QuantStats_1 _701 = QuantStats_1{ half(fast::min(60000.0, square_error_1)), ushort(0) };
+        QuantStats _703;
+        _703.square_error = _701.square_error;
+        _703.payload_cost = _701.payload_cost;
+        block_stats.stats[block_index].errors[msb + 1] = _703;
+    }
+    uint byte_offset = uint(scan) + global_offset;
+    bool need_sign = (result.block4x2_shifted != 0) || (quality_planes != 0);
+    if (need_sign)
+    {
+        uint4 s0 = uint4(texels[0] < float4(0.0)) << uint4(0u, 1u, 2u, 3u);
+        uint4 s1 = uint4(texels[1] < float4(0.0)) << uint4(4u, 5u, 6u, 7u);
+        uint s = ((((((s0.x | s0.y) | s0.z) | s0.w) | s1.x) | s1.y) | s1.z) | s1.w;
+        uint _763 = byte_offset;
+        byte_offset = _763 + uint(1);
+        payload_data.data[_763] = uchar(s);
+        int plane_iterations = quality_planes + int(plane_code);
+        int _776 = plane_iterations - 1;
+        int q_1 = _776;
+        do
+        {
+            s0 = uint4(extract_bits(uint(abs_quant_texels0.x), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels0.y), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels0.z), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels0.w), uint(q_1), uint(1)));
+            s1 = uint4(extract_bits(uint(abs_quant_texels1.x), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels1.y), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels1.z), uint(q_1), uint(1)), extract_bits(uint(abs_quant_texels1.w), uint(q_1), uint(1)));
+            s0 = s0 << uint4(0u, 1u, 2u, 3u);
+            s1 = s1 << uint4(4u, 5u, 6u, 7u);
+            s = ((((((s0.x | s0.y) | s0.z) | s0.w) | s1.x) | s1.y) | s1.z) | s1.w;
+            uint _850 = byte_offset;
+            byte_offset = _850 + uint(1);
+            payload_data.data[_850] = uchar(s);
+            q_1--;
+        } while (q_1 >= 0);
+    }
+}
+
+kernel void pyrowave_wavelet_quant(constant Registers& registers [[buffer(0)]], device SSBOMeta& block_meta [[buffer(1)]], device SSBOBlockStats& block_stats [[buffer(2)]], device Payloads& payload_data [[buffer(3)]], texture2d_array<float> uTexture [[texture(0)]], sampler uTextureSmplr [[sampler(0)]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]])
+{
+    uint local_index = (gl_SubgroupID * gl_SubgroupSize) + gl_SubgroupInvocationID;
+    uint block_local_index = extract_bits(local_index, uint(0), uint(3));
+    uint block_x = extract_bits(local_index, uint(3), uint(2));
+    uint block_y = extract_bits(local_index, uint(5), uint(2));
+    uint param = block_local_index << uint(3);
+    int2 local_coord = unswizzle8x8(param);
+    int2 coord = int2(gl_WorkGroupID.xy) * int2(32);
+    coord += (int2(8) * int2(int(block_x), int(block_y)));
+    coord += local_coord;
+    int2 block_index = (int2(4) * int2(gl_WorkGroupID.xy)) + int2(int(block_x), int(block_y));
+    float3 uv = float3(float2(coord) * registers.inv_resolution, registers.input_layer);
+    float4 texels0 = uTexture.gather(uTextureSmplr, uv.xy, uint(rint(uv.z)), int2(1), component::x).wxzy;
+    float4 texels1 = uTexture.gather(uTextureSmplr, uv.xy, uint(rint(uv.z)), int2(3, 1), component::x).wxzy;
+    float4 scaled_texels0 = texels0 * registers.quant_resolution;
+    float4 scaled_texels1 = texels1 * registers.quant_resolution;
+    bool in_bounds = all(block_index < registers.resolution_8x8_blocks);
+    if (in_bounds)
+    {
+        int2 param_1 = block_index;
+        float2x4 param_2 = float2x4(float4(scaled_texels0), float4(scaled_texels1));
+        encode_payload(param_1, param_2, gl_SubgroupInvocationID, registers, block_meta, block_stats, payload_data);
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char analyze_rate_control_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+template<typename T>
+inline T spvSubgroupShuffleXor(T value, ushort mask)
+{
+    return simd_shuffle_xor(value, mask);
+}
+
+template<>
+inline bool spvSubgroupShuffleXor(bool value, ushort mask)
+{
+    return !!simd_shuffle_xor((ushort)value, mask);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffleXor(vec<bool, N> value, ushort mask)
+{
+    return (vec<bool, N>)simd_shuffle_xor((vec<ushort, N>)value, mask);
+}
+
+template<typename T>
+inline T spvSubgroupShuffleUp(T value, ushort delta)
+{
+    return simd_shuffle_up(value, delta);
+}
+
+template<>
+inline bool spvSubgroupShuffleUp(bool value, ushort delta)
+{
+    return !!simd_shuffle_up((ushort)value, delta);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffleUp(vec<bool, N> value, ushort delta)
+{
+    return (vec<bool, N>)simd_shuffle_up((vec<ushort, N>)value, delta);
+}
+
+struct RDOperation
+{
+    int quant;
+    uint block_offset_saving;
+};
+
+struct Buckets
+{
+    uint count;
+    uint consumed_payload;
+    char _m2_pad[56];
+    uint total_savings_per_bucket[2048];
+    RDOperation rdo_operations[1];
+};
+
+struct Registers
+{
+    int2 resolution;
+    int2 resolution_8x8_blocks;
+    int block_offset_8x8;
+    int block_stride_8x8;
+    int block_offset_32x32;
+    int block_stride_32x32;
+    uint total_wg_count;
+    uint num_blocks_aligned;
+    uint block_index_shamt;
+};
+
+struct RDOperation_1
+{
+    int quant;
+    uint block_offset_saving;
+};
+
+struct QuantStats
+{
+    half square_error;
+    ushort payload_cost;
+};
+
+struct BlockStats
+{
+    uint num_planes;
+    QuantStats errors[15];
+};
+
+struct SSBOBlockStats
+{
+    BlockStats stats[1];
+};
+
+struct QuantStats_1
+{
+    half square_error;
+    ushort payload_cost;
+};
+
+static inline __attribute__((always_inline))
+uint distortion_to_bucket_index(thread const float& d, thread const float& cost, thread const float& d_base, thread const float& cost_base)
+{
+    if (cost == cost_base)
+    {
+        return 0u;
+    }
+    float index = 60.0 + (2.0 * log2(fast::max(d - d_base, 0.0) / (cost_base - cost)));
+    return uint(fast::max(index + 0.5, 0.0));
+}
+
+static inline __attribute__((always_inline))
+uint inclusive_max_clustered16(thread uint& v, thread uint& gl_SubgroupInvocationID)
+{
+    v = min(v, (112u + gl_SubgroupInvocationID));
+    for (uint i = 1u; i < 16u; i *= 2u)
+    {
+        uint up = spvSubgroupShuffleUp(v, i) + i;
+        v = max(v, ((gl_SubgroupInvocationID >= i) ? up : 0u));
+    }
+    return v;
+}
+
+static inline __attribute__((always_inline))
+void emit_rdo_operations(thread uint& gl_SubgroupInvocationID, threadgroup spvUnsafeArray<uint, 16>& shared_rate_cost, threadgroup spvUnsafeArray<float, 16>& shared_distortion, device Buckets& buckets, thread uint3& gl_WorkGroupID, constant Registers& registers)
+{
+    float cost;
+    float distortion;
+    if (gl_SubgroupInvocationID < 16u)
+    {
+        cost = float(shared_rate_cost[gl_SubgroupInvocationID]);
+        distortion = shared_distortion[gl_SubgroupInvocationID];
+    }
+    else
+    {
+        cost = float(shared_rate_cost[gl_SubgroupInvocationID]);
+        distortion = 1000000015047466219876688855040.0;
+    }
+    float param = distortion;
+    float param_1 = cost;
+    float param_2 = shared_distortion[0];
+    float param_3 = float(shared_rate_cost[0]);
+    uint bucket_index = distortion_to_bucket_index(param, param_1, param_2, param_3);
+    if (gl_SubgroupInvocationID == 0u)
+    {
+        bucket_index = 0u;
+    }
+    uint param_4 = bucket_index;
+    uint _139 = inclusive_max_clustered16(param_4, gl_SubgroupInvocationID);
+    uint inclusive_bucket_index = _139;
+    if (gl_SubgroupInvocationID == 0u)
+    {
+        uint unquantized_cost = shared_rate_cost[0];
+        uint _158 = atomic_fetch_add_explicit((device atomic_uint*)&buckets.consumed_payload, unquantized_cost, memory_order_relaxed);
+    }
+    else
+    {
+        if (gl_SubgroupInvocationID < 16u)
+        {
+            uint saving = shared_rate_cost[gl_SubgroupInvocationID - 1u] - shared_rate_cost[gl_SubgroupInvocationID];
+            if (saving != 0u)
+            {
+                int2 block32x32_index = int2(gl_WorkGroupID.xy);
+                int block_index = (registers.block_offset_32x32 + (block32x32_index.y * registers.block_stride_32x32)) + block32x32_index.x;
+                uint subdivision = uint(block_index >> int(registers.block_index_shamt));
+                uint _221 = atomic_fetch_add_explicit((device atomic_uint*)&buckets.total_savings_per_bucket[(inclusive_bucket_index * 16u) + subdivision], saving, memory_order_relaxed);
+                RDOperation_1 _240 = RDOperation_1{ int(gl_SubgroupInvocationID), uint(block_index) | (saving << uint(16)) };
+                RDOperation _243;
+                _243.quant = _240.quant;
+                _243.block_offset_saving = _240.block_offset_saving;
+                buckets.rdo_operations[uint(block_index) + (inclusive_bucket_index * registers.num_blocks_aligned)] = _243;
+            }
+        }
+    }
+}
+
+kernel void pyrowave_analyze_rate_control(device Buckets& buckets [[buffer(0)]], constant Registers& registers [[buffer(1)]], device SSBOBlockStats& block_stats [[buffer(2)]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup spvUnsafeArray<uint, 16> shared_rate_cost;
+    threadgroup spvUnsafeArray<float, 16> shared_distortion;
+    threadgroup spvUnsafeArray<uint, 4> shared_tmp;
+    uint index = gl_SubgroupInvocationID + (gl_SubgroupSize * gl_SubgroupID);
+    int2 block32x32_index = int2(gl_WorkGroupID.xy);
+    int2 local_block_index = int2(int(extract_bits(index, uint(0), uint(2))), int(extract_bits(index, uint(2), uint(2))));
+    int2 block8x8_index = (int2(4) * block32x32_index) + local_block_index;
+    bool block8x8_in_range = all(block8x8_index < registers.resolution_8x8_blocks);
+    int block_index_8x8 = (registers.block_offset_8x8 + (registers.block_stride_8x8 * block8x8_index.y)) + block8x8_index.x;
+    uint num_active_planes;
+    if (block8x8_in_range)
+    {
+        num_active_planes = block_stats.stats[block_index_8x8].num_planes;
+    }
+    uint bit_index = index >> uint(4);
+    for (uint i = bit_index; i < 16u; i += 4u)
+    {
+        float dist = 0.0;
+        uint cost = 0u;
+        if (block8x8_in_range)
+        {
+            uint _331 = min(i, num_active_planes);
+            QuantStats_1 _335;
+            _335.square_error = block_stats.stats[block_index_8x8].errors[_331].square_error;
+            _335.payload_cost = block_stats.stats[block_index_8x8].errors[_331].payload_cost;
+            QuantStats_1 stats = _335;
+            dist = float(stats.square_error);
+            cost = uint(stats.payload_cost);
+        }
+        if (cost != 0u)
+        {
+            cost += 24u;
+        }
+        if (gl_SubgroupSize == 16u)
+        {
+            cost = simd_sum(cost);
+            dist = simd_sum(dist);
+        }
+        else
+        {
+            cost += spvSubgroupShuffleXor(cost, 1u);
+            cost += spvSubgroupShuffleXor(cost, 2u);
+            cost += spvSubgroupShuffleXor(cost, 4u);
+            cost += spvSubgroupShuffleXor(cost, 8u);
+            dist += spvSubgroupShuffleXor(dist, 1u);
+            dist += spvSubgroupShuffleXor(dist, 2u);
+            dist += spvSubgroupShuffleXor(dist, 4u);
+            dist += spvSubgroupShuffleXor(dist, 8u);
+        }
+        if ((index & 15u) == 0u)
+        {
+            if (cost != 0u)
+            {
+                cost += 64u;
+            }
+            shared_rate_cost[i] = (cost + 31u) >> uint(5);
+            shared_distortion[i] = dist;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gl_SubgroupID == 0u)
+    {
+        emit_rdo_operations(gl_SubgroupInvocationID, shared_rate_cost, shared_distortion, buckets, gl_WorkGroupID, registers);
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char analyze_rate_control_finalize_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+struct Buckets
+{
+    char _m0_pad[64];
+    uint4 total_savings_per_bucket[512];
+};
+
+kernel void pyrowave_analyze_rate_control_finalize(device Buckets& buckets [[buffer(0)]], uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]])
+{
+    threadgroup spvUnsafeArray<uint, 512> shared_scan;
+    uint4 v = buckets.total_savings_per_bucket[gl_LocalInvocationIndex];
+    v.y += v.x;
+    v.z += v.y;
+    v.w += v.z;
+    shared_scan[gl_LocalInvocationIndex] = v.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint _step = 1u; _step < 256u; _step *= 2u)
+    {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint shuffled_up = 0u;
+        if (gl_LocalInvocationIndex >= _step)
+        {
+            shuffled_up = shared_scan[gl_LocalInvocationIndex - _step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        v += uint4(shuffled_up);
+        shared_scan[gl_LocalInvocationIndex] = v.w;
+    }
+    buckets.total_savings_per_bucket[gl_LocalInvocationIndex] = v;
+}
+
+)PYROWAVE_MSL";
+
+static const char resolve_rate_control_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+template<typename T>
+inline T spvSubgroupShuffle(T value, ushort lane)
+{
+    return simd_shuffle(value, lane);
+}
+
+template<>
+inline bool spvSubgroupShuffle(bool value, ushort lane)
+{
+    return !!simd_shuffle((ushort)value, lane);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffle(vec<bool, N> value, ushort lane)
+{
+    return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, lane);
+}
+
+template<>
+inline ulong spvSubgroupShuffle(ulong value, ushort lane)
+{
+    return as_type<ulong>(spvSubgroupShuffle(as_type<uint2>(value), lane));
+}
+
+template<>
+inline ulong2 spvSubgroupShuffle(ulong2 value, ushort lane)
+{
+    return ulong2(spvSubgroupShuffle(value.x, lane), spvSubgroupShuffle(value.y, lane));
+}
+
+inline ulong3 spvSubgroupShuffle(ulong3 value, ushort lane)
+{
+    return ulong3(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.z, lane));
+}
+
+inline ulong4 spvSubgroupShuffle(ulong4 value, ushort lane)
+{
+    return ulong4(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.zw, lane));
+}
+
+template<uint N>
+inline vec<long, N> spvSubgroupShuffle(vec<long, N> value, ushort lane)
+{
+    return vec<long, N>(spvSubgroupShuffle(vec<ulong, N>(value), lane));
+}
+
+constant uint _7_tmp [[function_constant(0)]];
+constant uint _7 = is_function_constant_defined(_7_tmp) ? _7_tmp : 1u;
+
+struct RDOperation
+{
+    int quant;
+    uint block_offset_saving;
+};
+
+struct Buckets
+{
+    char _m0_pad[4];
+    int consumed_payload;
+    char _m1_pad[56];
+    int total_savings_per_bucket[2048];
+    RDOperation rdo_operations[1];
+};
+
+struct Registers
+{
+    uint target_payload_size;
+    uint num_blocks_per_subdivision;
+};
+
+struct RDOperation_1
+{
+    int quant;
+    uint block_offset_saving;
+};
+
+struct QuantList
+{
+    int data[1];
+};
+
+constant uint _169 = is_function_constant_defined(_7_tmp) ? _7_tmp : 1u;
+constant uint3 _170 = uint3(_169, 1u, 1u);
+
+kernel void pyrowave_resolve_rate_control(device Buckets& buckets [[buffer(0)]], constant Registers& registers [[buffer(1)]], device QuantList& quant_data [[buffer(2)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]])
+{
+    int required_savings_per_bucket = buckets.consumed_payload - int(registers.target_payload_size);
+    if (gl_WorkGroupID.x != 0u)
+    {
+        int prev_bucket_total = buckets.total_savings_per_bucket[gl_WorkGroupID.x - 1u];
+        if (buckets.total_savings_per_bucket[gl_WorkGroupID.x] == prev_bucket_total)
+        {
+            return;
+        }
+        required_savings_per_bucket -= prev_bucket_total;
+    }
+    else
+    {
+        if (buckets.total_savings_per_bucket[gl_WorkGroupID.x] == 0)
+        {
+            return;
+        }
+    }
+    if (required_savings_per_bucket <= 0)
+    {
+        return;
+    }
+    uint total_saved = 0u;
+    uint i = 0u;
+    for (;;)
+    {
+        bool _86 = i < registers.num_blocks_per_subdivision;
+        bool _93;
+        if (_86)
+        {
+            _93 = total_saved < uint(required_savings_per_bucket);
+        }
+        else
+        {
+            _93 = _86;
+        }
+        if (_93)
+        {
+            RDOperation_1 op = RDOperation_1{ 0, 0u };
+            if ((i + gl_SubgroupInvocationID) < registers.num_blocks_per_subdivision)
+            {
+                uint _116 = ((gl_WorkGroupID.x * registers.num_blocks_per_subdivision) + i) + gl_SubgroupInvocationID;
+                RDOperation_1 _120;
+                _120.quant = buckets.rdo_operations[_116].quant;
+                _120.block_offset_saving = buckets.rdo_operations[_116].block_offset_saving;
+                op = _120;
+            }
+            uint saving = extract_bits(op.block_offset_saving, uint(16), uint(16));
+            uint block_offset = extract_bits(op.block_offset_saving, uint(0), uint(16));
+            uint scan_saving = simd_prefix_inclusive_sum(saving);
+            bool should_apply_quant = ((total_saved + scan_saving) - saving) < uint(required_savings_per_bucket);
+            if (should_apply_quant && (saving != 0u))
+            {
+                int _158 = atomic_fetch_max_explicit((device atomic_int*)&quant_data.data[block_offset], op.quant, memory_order_relaxed);
+            }
+            total_saved += spvSubgroupShuffle(scan_saving, gl_SubgroupSize - 1u);
+            i += gl_SubgroupSize;
+            continue;
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
+)PYROWAVE_MSL";
+
+static const char block_packing_msl_source[] = R"PYROWAVE_MSL(
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wmissing-braces"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+#include <metal_atomic>
+
+using namespace metal;
+
+template<typename T, size_t Num>
+struct spvUnsafeArray
+{
+    T elements[Num ? Num : 1];
+    
+    thread T& operator [] (size_t pos) thread
+    {
+        return elements[pos];
+    }
+    constexpr const thread T& operator [] (size_t pos) const thread
+    {
+        return elements[pos];
+    }
+    
+    device T& operator [] (size_t pos) device
+    {
+        return elements[pos];
+    }
+    constexpr const device T& operator [] (size_t pos) const device
+    {
+        return elements[pos];
+    }
+    
+    constexpr const constant T& operator [] (size_t pos) const constant
+    {
+        return elements[pos];
+    }
+    
+    threadgroup T& operator [] (size_t pos) threadgroup
+    {
+        return elements[pos];
+    }
+    constexpr const threadgroup T& operator [] (size_t pos) const threadgroup
+    {
+        return elements[pos];
+    }
+};
+
+// Implementation of the GLSL findLSB() function
+template<typename T>
+inline T spvFindLSB(T x)
+{
+    return select(ctz(x), T(-1), x == T(0));
+}
+
+inline uint4 spvSubgroupBallot(bool value)
+{
+    simd_vote vote = simd_ballot(value);
+    // simd_ballot() returns a 64-bit integer-like object, but
+    // SPIR-V callers expect a uint4. We must convert.
+    // FIXME: This won't include higher bits if Apple ever supports
+    // 128 lanes in an SIMD-group.
+    return uint4(as_type<uint2>((simd_vote::vote_t)vote), 0, 0);
+}
+
+template<typename T>
+inline T spvSubgroupShuffle(T value, ushort lane)
+{
+    return simd_shuffle(value, lane);
+}
+
+template<>
+inline bool spvSubgroupShuffle(bool value, ushort lane)
+{
+    return !!simd_shuffle((ushort)value, lane);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffle(vec<bool, N> value, ushort lane)
+{
+    return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, lane);
+}
+
+template<>
+inline ulong spvSubgroupShuffle(ulong value, ushort lane)
+{
+    return as_type<ulong>(spvSubgroupShuffle(as_type<uint2>(value), lane));
+}
+
+template<>
+inline ulong2 spvSubgroupShuffle(ulong2 value, ushort lane)
+{
+    return ulong2(spvSubgroupShuffle(value.x, lane), spvSubgroupShuffle(value.y, lane));
+}
+
+inline ulong3 spvSubgroupShuffle(ulong3 value, ushort lane)
+{
+    return ulong3(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.z, lane));
+}
+
+inline ulong4 spvSubgroupShuffle(ulong4 value, ushort lane)
+{
+    return ulong4(spvSubgroupShuffle(value.xy, lane), spvSubgroupShuffle(value.zw, lane));
+}
+
+template<uint N>
+inline vec<long, N> spvSubgroupShuffle(vec<long, N> value, ushort lane)
+{
+    return vec<long, N>(spvSubgroupShuffle(vec<ulong, N>(value), lane));
+}
+
+template<typename T>
+inline T spvSubgroupShuffleUp(T value, ushort delta)
+{
+    return simd_shuffle_up(value, delta);
+}
+
+template<>
+inline bool spvSubgroupShuffleUp(bool value, ushort delta)
+{
+    return !!simd_shuffle_up((ushort)value, delta);
+}
+
+template<uint N>
+inline vec<bool, N> spvSubgroupShuffleUp(vec<bool, N> value, ushort delta)
+{
+    return (vec<bool, N>)simd_shuffle_up((vec<ushort, N>)value, delta);
+}
+
+template<uint N, uint offset>
+struct spvClusteredAddDetail;
+
+// Base cases
+template<>
+struct spvClusteredAddDetail<1, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return value;
+    }
+};
+
+template<uint offset>
+struct spvClusteredAddDetail<1, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // If the target lane is inactive, then return identity.
+        if (!extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], (lid ^ offset) % 32, 1))
+            return 0;
+        return simd_shuffle_xor(value, offset);
+    }
+};
+
+template<>
+struct spvClusteredAddDetail<4, 0>
+{
+    template<typename T>
+    static T op(T value, uint)
+    {
+        return quad_sum(value);
+    }
+};
+
+template<uint offset>
+struct spvClusteredAddDetail<4, offset>
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        // Here, we care if any of the lanes in the quad are active.
+        uint quad_mask = extract_bits(as_type<uint2>((simd_vote::vote_t)simd_active_threads_mask())[(lid ^ offset) / 32], ((lid ^ offset) % 32) & ~3, 4);
+        if (!quad_mask)
+            return 0;
+        // But we need to make sure we shuffle from an active lane.
+        return simd_shuffle(quad_sum(value), ((lid ^ offset) & ~3) | ctz(quad_mask));
+    }
+};
+
+// General case
+template<uint N, uint offset>
+struct spvClusteredAddDetail
+{
+    template<typename T>
+    static T op(T value, uint lid)
+    {
+        return spvClusteredAddDetail<N/2, offset>::op(value, lid) + spvClusteredAddDetail<N/2, offset + N/2>::op(value, lid);
+    }
+};
+
+template<uint N, typename T>
+T spvClustered_sum(T value, uint lid)
+{
+    return spvClusteredAddDetail<N, 0>::op(value, lid);
+}
+
+struct Payloads
+{
+    char _m0_pad[4];
+    uint bitstream_payload_counter;
+    uchar data[1];
+};
+
+struct BitstreamPayload8Bit
+{
+    uchar data[1];
+};
+
+struct Registers
+{
+    int2 resolution;
+    int2 resolution_32x32_blocks;
+    int2 resolution_8x8_blocks;
+    uint quant_resolution_code;
+    uint sequence_code;
+    int block_offset_32x32;
+    int block_stride_32x32;
+    int block_offset_8x8;
+    int block_stride_8x8;
+};
+
+struct RateControlQuant
+{
+    int data[1];
+};
+
+struct BlockMeta
+{
+    uint code_word;
+    uint offset;
+};
+
+struct BlockMeta_1
+{
+    uint code_word;
+    uint offset;
+};
+
+struct SSBOMeta
+{
+    BlockMeta_1 meta[1];
+};
+
+struct QuantStats
+{
+    half square_error;
+    ushort payload_cost;
+};
+
+struct BlockStats
+{
+    uint num_planes;
+    QuantStats errors[15];
+};
+
+struct SSBOBlockStats
+{
+    BlockStats stats[1];
+};
+
+struct BitstreamPayload
+{
+    uint data[1];
+};
+
+struct BitstreamPacket
+{
+    uint offset;
+    uint num_words;
+};
+
+struct BitstreamMeta
+{
+    BitstreamPacket packets[1];
+};
+
+struct BitstreamPacket_1
+{
+    uint offset;
+    uint num_words;
+};
+
+struct BitstreamPayload16Bit
+{
+    ushort data[1];
+};
+
+static inline __attribute__((always_inline))
+uint quantize_code_word(thread uint& control_word, thread int& quant)
+{
+    if ((quant != 0) && (control_word != 0u))
+    {
+        int q_bits = int(extract_bits(control_word, uint(16), uint(4)));
+        int sub_quant = min(q_bits, quant);
+        q_bits -= sub_quant;
+        quant -= sub_quant;
+        if (quant != 0)
+        {
+            quant = min(quant, 3);
+            uint plane0 = control_word & 21845u;
+            uint plane1 = (control_word & 43690u) >> uint(1);
+            uint plane2 = plane0 & plane1;
+            do
+            {
+                plane0 = plane1;
+                plane1 = plane2;
+                plane2 = 0u;
+                quant--;
+            } while (quant != 0);
+            plane0 &= (~plane1);
+            uint new_control_word = plane0 | (plane1 << uint(1));
+            control_word = insert_bits(control_word, new_control_word, uint(0), uint(16));
+        }
+        control_word = insert_bits(control_word, uint(q_bits), uint(16), uint(4));
+    }
+    return control_word;
+}
+
+static inline __attribute__((always_inline))
+uint compute_required_8x8_size(thread const uint& control_word)
+{
+    int q_bits = int(extract_bits(control_word, uint(16), uint(4)));
+    uint lsbs = control_word & 21845u;
+    uint msbs = control_word & 43690u;
+    uint msbs_shift = msbs >> uint(1);
+    msbs |= msbs_shift;
+    return uint((int(popcount(lsbs)) + int(popcount(msbs))) + (q_bits * 8));
+}
+
+static inline __attribute__((always_inline))
+uint modify_quant_code(thread uint& code, thread const int& quant)
+{
+    int e = int(extract_bits(code, uint(3), uint(5)));
+    e = max((e - quant), 0);
+    code = insert_bits(code, uint(e), uint(3), uint(5));
+    return code;
+}
+
+static inline __attribute__((always_inline))
+uint inclusive_add_clustered16(thread uint& v, thread uint& gl_SubgroupInvocationID)
+{
+    for (uint i = 1u; i < 16u; i *= 2u)
+    {
+        uint up = spvSubgroupShuffleUp(v, i);
+        v += (((gl_SubgroupInvocationID & 15u) >= i) ? up : 0u);
+    }
+    return v;
+}
+
+static inline __attribute__((always_inline))
+uint copy_bytes(thread uint& output_offset, thread uint& input_offset, thread uint& count, device Payloads& payload_data, device BitstreamPayload8Bit& bitstream_data_8b)
+{
+    uint significant_mask = 0u;
+    do
+    {
+        uint in_data = uint(payload_data.data[input_offset]);
+        significant_mask |= in_data;
+        uint _174 = output_offset;
+        output_offset = _174 + uint(1);
+        bitstream_data_8b.data[_174] = uchar(in_data);
+        count--;
+        input_offset++;
+    } while (count > 0u);
+    return significant_mask;
+}
+
+static inline __attribute__((always_inline))
+void append_sign_plane(thread const uint& bank, thread uint& local_sign_offset, thread const uint& sign_mask, thread uint& significant_mask, thread uint& pending_sign_write, thread uint& pending_sign_mask, threadgroup spvUnsafeArray<spvUnsafeArray<uint, 32>, 4>& shared_sign_bank)
+{
+    while (significant_mask != 0u)
+    {
+        int bit = int(spvFindLSB(significant_mask));
+        significant_mask &= (significant_mask - 1u);
+        int out_bit = int(local_sign_offset & 31u);
+        pending_sign_write = insert_bits(pending_sign_write, extract_bits(sign_mask, uint(bit), uint(1)), uint(out_bit), uint(1));
+        pending_sign_mask = insert_bits(pending_sign_mask, 1u, uint(out_bit), uint(1));
+        if (out_bit == 31)
+        {
+            if (pending_sign_mask == 4294967295u)
+            {
+                shared_sign_bank[bank][local_sign_offset / 32u] = pending_sign_write;
+            }
+            else
+            {
+                uint _293 = atomic_fetch_and_explicit((threadgroup atomic_uint*)&shared_sign_bank[bank][local_sign_offset / 32u], ~pending_sign_mask, memory_order_relaxed);
+                uint _301 = atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_sign_bank[bank][local_sign_offset / 32u], pending_sign_write & pending_sign_mask, memory_order_relaxed);
+            }
+            pending_sign_mask = 0u;
+        }
+        local_sign_offset++;
+    }
+}
+
+static inline __attribute__((always_inline))
+void flush_sign_plane(thread const uint& bank, thread const uint& local_sign_offset, thread uint& pending_sign_write, thread uint& pending_sign_mask, threadgroup spvUnsafeArray<spvUnsafeArray<uint, 32>, 4>& shared_sign_bank)
+{
+    if (pending_sign_mask != 0u)
+    {
+        uint _314 = atomic_fetch_and_explicit((threadgroup atomic_uint*)&shared_sign_bank[bank][local_sign_offset / 32u], ~pending_sign_mask, memory_order_relaxed);
+        uint _322 = atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_sign_bank[bank][local_sign_offset / 32u], pending_sign_write & pending_sign_mask, memory_order_relaxed);
+        pending_sign_mask = 0u;
+    }
+}
+
+kernel void pyrowave_block_packing(device Payloads& payload_data [[buffer(0)]], device void* spvBufferAliasSet0Binding0 [[buffer(1)]], constant Registers& registers [[buffer(2)]], device RateControlQuant& quant_data [[buffer(3)]], device SSBOMeta& block_meta [[buffer(4)]], device SSBOBlockStats& block_stats [[buffer(5)]], device BitstreamMeta& bitstream_meta [[buffer(6)]], uint gl_SubgroupInvocationID [[thread_index_in_simdgroup]], uint gl_SubgroupSize [[threads_per_simdgroup]], uint gl_SubgroupID [[simdgroup_index_in_threadgroup]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]])
+{
+    device auto& bitstream_data_8b = *(device BitstreamPayload8Bit*)spvBufferAliasSet0Binding0;
+    device auto& bitstream_data = *(device BitstreamPayload*)spvBufferAliasSet0Binding0;
+    device auto& bitstream_data_16b = *(device BitstreamPayload16Bit*)spvBufferAliasSet0Binding0;
+    threadgroup spvUnsafeArray<spvUnsafeArray<uint, 32>, 4> shared_sign_bank;
+    uint pending_sign_write = 0u;
+    uint pending_sign_mask = 0u;
+    uint index = gl_SubgroupInvocationID + (gl_SubgroupSize * gl_SubgroupID);
+    uint linear_block_32x32_index = index >> uint(4);
+    int2 block32x32_index = int2(2) * int2(gl_WorkGroupID.xy);
+    block32x32_index.x += int(extract_bits(index, uint(4), uint(1)));
+    block32x32_index.y += int(extract_bits(index, uint(5), uint(1)));
+    int2 local_block_index = int2(int(extract_bits(index, uint(0), uint(2))), int(extract_bits(index, uint(2), uint(2))));
+    int2 block8x8_index = (int2(4) * block32x32_index) + local_block_index;
+    bool in_range_8x8 = all(block8x8_index < registers.resolution_8x8_blocks);
+    bool in_range_32x32 = all(block32x32_index < registers.resolution_32x32_blocks);
+    uint num_bits_for_q = 0u;
+    int quant;
+    if (in_range_32x32)
+    {
+        int block_index = (registers.block_offset_32x32 + (registers.block_stride_32x32 * block32x32_index.y)) + block32x32_index.x;
+        quant = quant_data.data[block_index];
+    }
+    else
+    {
+        quant = 0;
+    }
+    BlockMeta meta;
+    if (in_range_8x8)
+    {
+        int block_index_1 = (registers.block_offset_8x8 + (registers.block_stride_8x8 * block8x8_index.y)) + block8x8_index.x;
+        BlockMeta _449;
+        _449.code_word = block_meta.meta[block_index_1].code_word;
+        _449.offset = block_meta.meta[block_index_1].offset;
+        meta = _449;
+        uint num_planes = block_stats.stats[block_index_1].num_planes;
+        num_bits_for_q = uint(block_stats.stats[block_index_1].errors[min(num_planes, uint(quant))].payload_cost);
+    }
+    else
+    {
+        meta = BlockMeta{ 0u, 0u };
+    }
+    uint param = meta.code_word;
+    int param_1 = quant;
+    uint _481 = quantize_code_word(param, param_1);
+    uint code_word = _481;
+    bool active_code_word = (code_word & 65535u) != 0u;
+    uint4 code_word_ballot = spvSubgroupBallot(active_code_word);
+    uint _499;
+    if ((gl_SubgroupSize >= 64u) && (linear_block_32x32_index >= 2u))
+    {
+        _499 = code_word_ballot.y;
+    }
+    else
+    {
+        _499 = code_word_ballot.x;
+    }
+    uint local_ballot = _499;
+    local_ballot = extract_bits(local_ballot, uint(int(16u * (linear_block_32x32_index & 1u))), uint(16));
+    uint param_2 = code_word;
+    uint required_plane_bytes = compute_required_8x8_size(param_2);
+    uint required_sign_bits = num_bits_for_q - (required_plane_bytes * 8u);
+    uint required_bits_with_meta = num_bits_for_q;
+    if (required_bits_with_meta != 0u)
+    {
+        required_bits_with_meta += 24u;
+    }
+    bool _538 = all(block32x32_index < registers.resolution_32x32_blocks);
+    bool _544;
+    if (_538)
+    {
+        _544 = (index & 15u) == 15u;
+    }
+    else
+    {
+        _544 = _538;
+    }
+    bool writes_header = _544;
+    uint payload_total_bits = spvClustered_sum<16>(required_bits_with_meta, gl_SubgroupInvocationID);
+    uint payload_total_words = (payload_total_bits + 31u) / 32u;
+    if (payload_total_words != 0u)
+    {
+        payload_total_words += 2u;
+    }
+    uint global_payload_offset = 0u;
+    if (writes_header && (payload_total_words != 0u))
+    {
+        uint _567 = atomic_fetch_add_explicit((device atomic_uint*)&payload_data.bitstream_payload_counter, payload_total_words, memory_order_relaxed);
+        global_payload_offset = _567;
+    }
+    global_payload_offset = spvSubgroupShuffle(global_payload_offset, gl_SubgroupInvocationID | 15u);
+    if (writes_header)
+    {
+        uint block_index_2 = uint((registers.block_offset_32x32 + (block32x32_index.y * registers.block_stride_32x32)) + block32x32_index.x);
+        if (payload_total_words != 0u)
+        {
+            bitstream_data.data[global_payload_offset + 0u] = (local_ballot | (payload_total_words << uint(16))) | (registers.sequence_code << uint(28));
+            uint param_3 = registers.quant_resolution_code;
+            int param_4 = quant;
+            uint _616 = modify_quant_code(param_3, param_4);
+            bitstream_data.data[global_payload_offset + 1u] = _616 | (block_index_2 << uint(8));
+        }
+        BitstreamPacket_1 _630 = BitstreamPacket_1{ global_payload_offset, payload_total_words };
+        BitstreamPacket _633;
+        _633.offset = _630.offset;
+        _633.num_words = _630.num_words;
+        bitstream_meta.packets[block_index_2] = _633;
+    }
+    uint total_subblocks = uint(int(popcount(local_ballot)));
+    uint param_5 = required_sign_bits;
+    uint _641 = inclusive_add_clustered16(param_5, gl_SubgroupInvocationID);
+    uint total_sign_bits = _641;
+    uint param_6 = required_plane_bytes;
+    uint _645 = inclusive_add_clustered16(param_6, gl_SubgroupInvocationID);
+    uint local_planes_offset = _645 - required_plane_bytes;
+    uint local_sign_offset = total_sign_bits - required_sign_bits;
+    uint global_planes_offset = ((4u * global_payload_offset) + (3u * total_subblocks)) + 8u;
+    uint global_sign_offset = global_planes_offset + spvClustered_sum<16>(required_plane_bytes, gl_SubgroupInvocationID);
+    global_planes_offset += local_planes_offset;
+    uint total_sign_bytes = (spvSubgroupShuffle(total_sign_bits, gl_SubgroupInvocationID | 15u) + 7u) / 8u;
+    if (active_code_word)
+    {
+        uint block_header_offset = uint(int(popcount(extract_bits(local_ballot, uint(0), uint((local_block_index.y * 4) + local_block_index.x)))));
+        uint in_q_bits = extract_bits(meta.code_word, uint(16), uint(4));
+        uint out_q_bits = extract_bits(code_word, uint(16), uint(4));
+        uint input_offset = meta.offset;
+        uint output_offset = global_planes_offset;
+        for (int bit_offset = 0; bit_offset < 16; bit_offset += 2)
+        {
+            uint out_planes = extract_bits(code_word, uint(bit_offset), uint(2)) + out_q_bits;
+            uint in_planes = extract_bits(meta.code_word, uint(bit_offset), uint(2)) + in_q_bits;
+            if (in_planes != 0u)
+            {
+                in_planes++;
+            }
+            uint sign_plane = uint(payload_data.data[input_offset]);
+            if (out_planes != 0u)
+            {
+                uint param_7 = output_offset;
+                uint param_8 = input_offset + 1u;
+                uint param_9 = out_planes;
+                uint _745 = copy_bytes(param_7, param_8, param_9, payload_data, bitstream_data_8b);
+                output_offset = param_7;
+                uint significant_mask = _745;
+                uint param_10 = linear_block_32x32_index;
+                uint param_11 = local_sign_offset;
+                uint param_12 = sign_plane;
+                uint param_13 = significant_mask;
+                append_sign_plane(param_10, param_11, param_12, param_13, pending_sign_write, pending_sign_mask, shared_sign_bank);
+                local_sign_offset = param_11;
+            }
+            input_offset += in_planes;
+        }
+        uint param_14 = linear_block_32x32_index;
+        uint param_15 = local_sign_offset;
+        flush_sign_plane(param_14, param_15, pending_sign_write, pending_sign_mask, shared_sign_bank);
+        bitstream_data_16b.data[((2u * global_payload_offset) + block_header_offset) + 4u] = ushort(code_word);
+        bitstream_data_8b.data[(((4u * global_payload_offset) + (2u * total_subblocks)) + block_header_offset) + 8u] = uchar(code_word >> uint(16));
+    }
+    simdgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup | mem_flags::mem_texture);
+    uint _794 = index & 15u;
+    for (uint i = _794; i < (total_sign_bytes / 4u); i += 16u)
+    {
+        uint sign_word = shared_sign_bank[linear_block_32x32_index][i];
+        uint offset_8b = global_sign_offset + (4u * i);
+        bitstream_data_8b.data[offset_8b + 0u] = uchar(sign_word >> uint(0));
+        bitstream_data_8b.data[offset_8b + 1u] = uchar(sign_word >> uint(8));
+        bitstream_data_8b.data[offset_8b + 2u] = uchar(sign_word >> uint(16));
+        bitstream_data_8b.data[offset_8b + 3u] = uchar(sign_word >> uint(24));
+    }
+    uint _847 = (total_sign_bytes & 4294967292u) + (index & 15u);
+    for (uint i_1 = _847; i_1 < total_sign_bytes; i_1 += 16u)
+    {
+        uint sign_word_1 = shared_sign_bank[linear_block_32x32_index][i_1 / 4u];
+        uint offset_8b_1 = global_sign_offset + i_1;
+        bitstream_data_8b.data[offset_8b_1] = uchar(sign_word_1 >> (8u * (i_1 & 3u)));
+    }
+}
+
+)PYROWAVE_MSL";
 }

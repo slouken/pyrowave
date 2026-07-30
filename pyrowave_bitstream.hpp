@@ -43,9 +43,23 @@ struct BitstreamSequenceHeader
 
 static_assert(sizeof(BitstreamSequenceHeader) == 8, "BitstreamSequenceHeader is not 8 bytes.");
 
+// Written by the encoder's block packing pass, one per 32x32 block. A zero
+// num_words means the block was not coded.
+struct BitstreamPacket
+{
+	uint32_t offset_u32;
+	uint32_t num_words;
+};
+
 enum
 {
 	BITSTREAM_EXTENDED_CODE_START_OF_FRAME = 0,
+};
+
+enum
+{
+	CHROMA_RESOLUTION_420 = 0,
+	CHROMA_RESOLUTION_444 = 1
 };
 
 static constexpr uint32_t SequenceCountMask = 0x7;
@@ -148,4 +162,59 @@ private:
 
 	bool decode_packet(const BitstreamHeader *header);
 };
+
+//////
+// Encoder side. Turning the GPU's per block output into network packets is pure
+// CPU work with no graphics dependency, so it lives here alongside the parser.
+
+// Sizes of the encoder's GPU side scratch buffers. Only here because they are
+// pure layout, derived from the block counts.
+static constexpr int BlockSpaceSubdivision = 16;
+static constexpr int NumRDOBuckets = 128;
+static constexpr int RDOBucketOffset = 64;
+
+struct BlockStats
+{
+	uint16_t square_error_fp16;
+	uint16_t encode_cost_bits;
+};
+
+struct BlockStatsBlock
+{
+	uint32_t num_planes;
+	BlockStats stats[15];
+};
+static_assert(sizeof(BlockStatsBlock) == 64, "BlockStatsBlock is not 64 bytes.");
+
+struct BlockMeta
+{
+	uint32_t code_word;
+	uint32_t offset;
+};
+
+struct RDOperation
+{
+	int32_t quant;
+	uint16_t block_offset;
+	uint16_t block_saving;
+};
+
+int compute_block_count_per_subdivision(int num_blocks);
+
+struct Packet
+{
+	size_t offset;
+	size_t size;
+};
+
+// How many packets the frame needs if each may carry at most packet_boundary
+// bytes. `mapped_meta` is block_count_32x32 BitstreamPacket entries.
+size_t compute_num_packets(const BlockLayout &layout, const void *mapped_meta, size_t packet_boundary);
+
+// Copies the coded blocks into `output_bitstream`, prefixed by a sequence header,
+// and fills in the packet boundaries. Returns the number of packets written,
+// which is at most what compute_num_packets() reported.
+size_t packetize(const BlockLayout &layout, Packet *packets, size_t packet_boundary,
+                 void *output_bitstream, size_t size,
+                 const void *mapped_meta, const void *mapped_bitstream);
 }
