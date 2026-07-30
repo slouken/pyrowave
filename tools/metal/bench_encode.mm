@@ -21,8 +21,8 @@
 // single median, or an A/B measured in two separate runs, can invent a result that
 // is not there.
 
-#include <Metal/Metal.hpp>
-#include <IOSurface/IOSurfaceRef.h>
+#import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include "pyrowave_metal.h"
 
@@ -372,20 +372,19 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	auto *pool = NS::AutoreleasePool::alloc()->init();
 
-	auto *mtl = MTL::CreateSystemDefaultDevice();
+	id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
 	if (!mtl)
 	{
 		fprintf(stderr, "No Metal device.\n");
 		return EXIT_FAILURE;
 	}
 
-	printf("Device: %s\n", mtl->name()->utf8String());
+	printf("Device: %s\n", mtl.name.UTF8String);
 	printf("%d iterations, all cases and both dispatch modes interleaved.\n\n", iterations);
 
 	pyrowave_device_create_info dinfo = {};
-	dinfo.mtl_device = mtl;
+	dinfo.mtl_device = (__bridge void *)mtl;
 	dinfo.message_callback = message_cb;
 
 	pyrowave_device device = nullptr;
@@ -469,7 +468,5 @@ int main(int argc, char **argv)
 		c.deinit();
 
 	pyrowave_device_destroy(device);
-	mtl->release();
-	pool->release();
 	return EXIT_SUCCESS;
 }

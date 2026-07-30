@@ -13,41 +13,40 @@ cd "$(dirname "$0")/../.."
 OUT=build-tools
 mkdir -p $OUT
 
-if [ ! -f metal-cpp/Metal/Metal.hpp ]; then
-	echo "metal-cpp missing; run ./checkout_metal_cpp.sh first." >&2
-	exit 1
-fi
-
-CXX="xcrun -sdk macosx clang++ -std=c++17 -O2 -fblocks -I. -Imetal-cpp"
+CXX="xcrun -sdk macosx clang++ -std=c++17 -O2 -fobjc-arc -I."
 FRAMEWORKS="-framework Metal -framework Foundation"
-# pyrowave_metal_common.cpp is the translation unit that instantiates metal-cpp and
-# defines the shared device object, so every tool that pulls in a backend needs it.
-COMMON="pyrowave_metal_common.cpp pyrowave_bitstream.cpp"
-DECODER="pyrowave_decoder_metal.cpp $COMMON"
-ENCODER="pyrowave_encoder_metal.cpp $COMMON"
+# pyrowave_metal_common.mm defines the shared device object, so every tool that pulls
+# in a backend needs it.
+COMMON="pyrowave_metal_common.mm pyrowave_bitstream.cpp"
+DECODER="pyrowave_decoder_metal.mm $COMMON"
+ENCODER="pyrowave_encoder_metal.mm $COMMON"
 
 echo "bench"
-$CXX $FRAMEWORKS tools/metal/bench.cpp $DECODER -o $OUT/bench
+$CXX $FRAMEWORKS tools/metal/bench.mm $DECODER -o $OUT/bench
 
 # The encoder's timing hooks are #ifdef'd out of ordinary builds, so ask for them.
 echo "bench_encode"
 $CXX $FRAMEWORKS -framework IOSurface -framework CoreFoundation \
 	-DPYROWAVE_METAL_BENCH_HOOKS \
-	tools/metal/bench_encode.cpp $ENCODER -o $OUT/bench_encode
+	tools/metal/bench_encode.mm $ENCODER -o $OUT/bench_encode
+
+echo "leak_test"
+$CXX $FRAMEWORKS -framework IOSurface -framework CoreFoundation \
+	tools/metal/leak_test.mm $ENCODER pyrowave_decoder_metal.mm -o $OUT/leak_test
 
 echo "dispatch_cost"
-$CXX $FRAMEWORKS tools/metal/dispatch_cost.cpp -o $OUT/dispatch_cost
+$CXX $FRAMEWORKS tools/metal/dispatch_cost.mm -o $OUT/dispatch_cost
 
 echo "counter_probe"
-$CXX $FRAMEWORKS tools/metal/counter_probe.cpp -o $OUT/counter_probe
+$CXX $FRAMEWORKS tools/metal/counter_probe.mm -o $OUT/counter_probe
 
 echo "iosurface_array_probe"
 $CXX $FRAMEWORKS -framework CoreVideo -framework IOSurface \
-	tools/metal/iosurface_array_probe.cpp -o $OUT/iosurface_array_probe
+	tools/metal/iosurface_array_probe.mm -o $OUT/iosurface_array_probe
 
 echo "iosurface_format_probe"
 $CXX $FRAMEWORKS -framework CoreVideo -framework IOSurface \
-	tools/metal/iosurface_format_probe.cpp -o $OUT/iosurface_format_probe
+	tools/metal/iosurface_format_probe.mm -o $OUT/iosurface_format_probe
 
 echo "iosurface_444_probe"
 xcrun -sdk macosx clang++ -std=c++17 -O2 -framework CoreVideo -framework IOSurface \

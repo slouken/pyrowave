@@ -6,9 +6,9 @@
 // enabled, which adds 0.5, so a correct decode must leave every output pixel at
 // exactly 0.5. That single expectation covers dequant, all five iDWT levels, the
 // texture views, hazard tracking and the final stores.
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 
-#include <IOSurface/IOSurfaceRef.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include "pyrowave_metal.h"
 #include "pyrowave_bitstream.hpp"
@@ -33,30 +33,29 @@ static void message_cb(void *, const char *msg)
 	printf("  [pyrowave] %s\n", msg);
 }
 
-static MTL::Texture *make_plane(MTL::Device *dev, int width, int height)
+static id<MTLTexture> make_plane(id<MTLDevice> dev, int width, int height)
 {
-	auto *desc = MTL::TextureDescriptor::alloc()->init();
-	desc->setTextureType(MTL::TextureType2D);
-	desc->setPixelFormat(MTL::PixelFormatR32Float);
-	desc->setWidth(width);
-	desc->setHeight(height);
-	desc->setUsage(MTL::TextureUsageShaderWrite | MTL::TextureUsageShaderRead);
-	desc->setStorageMode(MTL::StorageModeShared);
-	auto *tex = dev->newTexture(desc);
-	desc->release();
+	auto desc = [MTLTextureDescriptor new];
+	desc.textureType = MTLTextureType2D;
+	desc.pixelFormat = MTLPixelFormatR32Float;
+	desc.width = width;
+	desc.height = height;
+	desc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+	desc.storageMode = MTLStorageModeShared;
+	auto tex = [dev newTextureWithDescriptor:desc];
 
 	// Poison the contents so an unwritten pixel is detectable.
 	std::vector<float> poison(size_t(width) * height, -1.0f);
-	tex->replaceRegion(MTL::Region(0, 0, width, height), 0, poison.data(), width * sizeof(float));
+	[tex replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:poison.data() bytesPerRow:width * sizeof(float)];
 	return tex;
 }
 
-static void check_plane(MTL::Texture *tex, const char *label, int index)
+static void check_plane(id<MTLTexture> tex, const char *label, int index)
 {
-	const int width = int(tex->width());
-	const int height = int(tex->height());
+	const int width = int(tex.width);
+	const int height = int(tex.height);
 	std::vector<float> data(size_t(width) * height, -12345.0f);
-	tex->getBytes(data.data(), width * sizeof(float), MTL::Region(0, 0, width, height), 0);
+	[tex getBytes:data.data() bytesPerRow:width * sizeof(float) fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
 
 	size_t bad = 0;
 	float first_bad = 0.0f;
@@ -78,7 +77,7 @@ static void check_plane(MTL::Texture *tex, const char *label, int index)
 	      label, index, bad, data.size(), first_bad_index % width, first_bad_index / width, first_bad);
 }
 
-static void test_resolution(pyrowave_device device, MTL::Device *mtl, MTL::CommandQueue *queue,
+static void test_resolution(pyrowave_device device, id<MTLDevice> mtl, id<MTLCommandQueue> queue,
                             int width, int height, pyrowave_chroma_subsampling chroma)
 {
 	const bool is_420 = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420;
@@ -101,7 +100,7 @@ static void test_resolution(pyrowave_device device, MTL::Device *mtl, MTL::Comma
 	const int chroma_width = is_420 ? width / 2 : width;
 	const int chroma_height = is_420 ? height / 2 : height;
 
-	MTL::Texture *planes[3] = {
+	id<MTLTexture> planes[3] = {
 		make_plane(mtl, width, height),
 		make_plane(mtl, chroma_width, chroma_height),
 		make_plane(mtl, chroma_width, chroma_height),
@@ -109,22 +108,22 @@ static void test_resolution(pyrowave_device device, MTL::Device *mtl, MTL::Comma
 
 	pyrowave_gpu_buffers buffers = {};
 	for (int i = 0; i < 3; i++)
-		buffers.planes[i] = planes[i];
+		buffers.planes[i] = (__bridge void *)planes[i];
 
-	auto *cmd = queue->commandBuffer();
-	res = pyrowave_decoder_decode(decoder, cmd, &buffers);
+	auto cmd = [queue commandBuffer];
+	res = pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers);
 	CHECK(res == PYROWAVE_SUCCESS, "%dx%d %s: decode failed: %s",
 	      width, height, label, pyrowave_result_to_string(res));
 
-	cmd->commit();
-	cmd->waitUntilCompleted();
+	[cmd commit];
+	[cmd waitUntilCompleted];
 
-	CHECK(cmd->status() == MTL::CommandBufferStatusCompleted,
-	      "%dx%d %s: command buffer status %d", width, height, label, int(cmd->status()));
-	if (cmd->error())
+	CHECK(cmd.status == MTLCommandBufferStatusCompleted,
+	      "%dx%d %s: command buffer status %d", width, height, label, int(cmd.status));
+	if (cmd.error)
 	{
 		printf("FAIL %dx%d %s: GPU error: %s\n", width, height, label,
-		       cmd->error()->localizedDescription()->utf8String());
+		       cmd.error.localizedDescription.UTF8String);
 		g_failures++;
 	}
 
@@ -133,8 +132,6 @@ static void test_resolution(pyrowave_device device, MTL::Device *mtl, MTL::Comma
 	for (int i = 0; i < 3; i++)
 		check_plane(planes[i], full_label, i);
 
-	for (auto *plane : planes)
-		plane->release();
 	pyrowave_decoder_destroy(decoder);
 }
 
@@ -185,12 +182,12 @@ struct TestFrame
 	}
 };
 
-static double plane_psnr(MTL::Texture *tex, const std::vector<uint8_t> &reference)
+static double plane_psnr(id<MTLTexture> tex, const std::vector<uint8_t> &reference)
 {
-	const int width = int(tex->width());
-	const int height = int(tex->height());
+	const int width = int(tex.width);
+	const int height = int(tex.height);
 	std::vector<float> data(size_t(width) * height);
-	tex->getBytes(data.data(), width * sizeof(float), MTL::Region(0, 0, width, height), 0);
+	[tex getBytes:data.data() bytesPerRow:width * sizeof(float) fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
 
 	double error = 0.0;
 	for (size_t i = 0; i < data.size() && i < reference.size(); i++)
@@ -325,7 +322,7 @@ static IOSurfaceRef make_nv12_surface(const uint8_t *luma, const uint8_t *chroma
 
 // `out_planes`, when non-NULL, receives the decoded plane data so callers can check
 // that different input paths agree exactly rather than merely both being plausible.
-static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL::CommandQueue *queue,
+static void test_encode_round_trip(pyrowave_device device, id<MTLDevice> mtl, id<MTLCommandQueue> queue,
                                    int width, int height, pyrowave_chroma_subsampling chroma,
                                    EncodeInput input_kind, double min_psnr,
                                    std::vector<std::vector<float>> *out_planes = nullptr)
@@ -476,22 +473,22 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 	CHECK(pyrowave_decoder_decode_is_ready(decoder, false),
 	      "%s: every packet was pushed, so the frame should be ready", label);
 
-	MTL::Texture *planes[3] = {
+	id<MTLTexture> planes[3] = {
 		make_plane(mtl, width, height),
 		make_plane(mtl, frame.chroma_width, frame.chroma_height),
 		make_plane(mtl, frame.chroma_width, frame.chroma_height),
 	};
 	pyrowave_gpu_buffers buffers = {};
 	for (int i = 0; i < 3; i++)
-		buffers.planes[i] = planes[i];
+		buffers.planes[i] = (__bridge void *)planes[i];
 
-	auto *cmd = queue->commandBuffer();
-	CHECK(pyrowave_decoder_decode(decoder, cmd, &buffers) == PYROWAVE_SUCCESS,
+	auto cmd = [queue commandBuffer];
+	CHECK(pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers) == PYROWAVE_SUCCESS,
 	      "%s: decode failed", label);
-	cmd->commit();
-	cmd->waitUntilCompleted();
-	CHECK(cmd->status() == MTL::CommandBufferStatusCompleted, "%s: decode status %d", label,
-	      int(cmd->status()));
+	[cmd commit];
+	[cmd waitUntilCompleted];
+	CHECK(cmd.status == MTLCommandBufferStatusCompleted, "%s: decode status %d", label,
+	      int(cmd.status));
 
 	for (int i = 0; i < 3; i++)
 	{
@@ -506,16 +503,13 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 		out_planes->resize(3);
 		for (int i = 0; i < 3; i++)
 		{
-			const int w = int(planes[i]->width());
-			const int h = int(planes[i]->height());
+			const int w = int(planes[i].width);
+			const int h = int(planes[i].height);
 			(*out_planes)[i].assign(size_t(w) * h, 0.0f);
-			planes[i]->getBytes((*out_planes)[i].data(), w * sizeof(float),
-			                    MTL::Region(0, 0, w, h), 0);
+			[planes[i] getBytes:(*out_planes)[i].data() bytesPerRow:w * sizeof(float) fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
 		}
 	}
 
-	for (auto *plane : planes)
-		plane->release();
 	for (auto surface : surfaces)
 		if (surface)
 			CFRelease(surface);
@@ -528,7 +522,7 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 // decisions, so a bit-identical decode -- whatever route the pixels took in. This is
 // the real test of the NV12 swizzle: a channel mix-up survives a PSNR threshold but
 // cannot survive this.
-static void test_input_paths_agree(pyrowave_device device, MTL::Device *mtl, MTL::CommandQueue *queue,
+static void test_input_paths_agree(pyrowave_device device, id<MTLDevice> mtl, id<MTLCommandQueue> queue,
                                    int width, int height, pyrowave_chroma_subsampling chroma)
 {
 	const bool is_420 = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420;
@@ -579,17 +573,16 @@ static void test_input_paths_agree(pyrowave_device device, MTL::Device *mtl, MTL
 
 int main()
 {
-	auto *pool = NS::AutoreleasePool::alloc()->init();
 
-	auto *mtl = MTL::CreateSystemDefaultDevice();
+	id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
 	if (!mtl)
 	{
 		printf("No Metal device.\n");
 		return 1;
 	}
-	printf("Device: %s\n", mtl->name()->utf8String());
+	printf("Device: %s\n", mtl.name.UTF8String);
 
-	CHECK(pyrowave_device_is_supported(mtl), "device reported unsupported");
+	CHECK(pyrowave_device_is_supported((__bridge void *)mtl), "device reported unsupported");
 	CHECK(!pyrowave_device_is_supported(nullptr), "NULL device reported supported");
 
 	uint32_t major = 0, minor = 0, patch = 0;
@@ -597,7 +590,7 @@ int main()
 	printf("API version %u.%u.%u\n", major, minor, patch);
 
 	pyrowave_device_create_info dinfo = {};
-	dinfo.mtl_device = mtl;
+	dinfo.mtl_device = (__bridge void *)mtl;
 	dinfo.message_callback = message_cb;
 
 	pyrowave_device device = nullptr;
@@ -606,7 +599,7 @@ int main()
 	if (res != PYROWAVE_SUCCESS)
 		return 1;
 
-	auto *queue = mtl->newCommandQueue();
+	auto queue = [mtl newCommandQueue];
 
 	test_resolution(device, mtl, queue, 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420);
 	test_resolution(device, mtl, queue, 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_444);
@@ -632,28 +625,26 @@ int main()
 		CHECK(pyrowave_decoder_create(&info, &decoder) == PYROWAVE_SUCCESS, "valid create failed");
 
 		// Wrong sized output plane must be rejected rather than corrupting memory.
-		MTL::Texture *planes[3] = {
+		id<MTLTexture> planes[3] = {
 			make_plane(mtl, 1920, 1080), make_plane(mtl, 960, 540), make_plane(mtl, 320, 240),
 		};
 		pyrowave_gpu_buffers buffers = {};
 		for (int i = 0; i < 3; i++)
-			buffers.planes[i] = planes[i];
+			buffers.planes[i] = (__bridge void *)planes[i];
 
-		auto *cmd = queue->commandBuffer();
+		auto cmd = [queue commandBuffer];
 		printf("  (expect one plane-size error)\n");
-		CHECK(pyrowave_decoder_decode(decoder, cmd, &buffers) == PYROWAVE_ERROR_INVALID_ARGUMENT,
+		CHECK(pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers) == PYROWAVE_ERROR_INVALID_ARGUMENT,
 		      "mismatched plane size accepted");
 
 		buffers.planes[1] = nullptr;
 		printf("  (expect one NULL plane error)\n");
-		CHECK(pyrowave_decoder_decode(decoder, cmd, &buffers) == PYROWAVE_ERROR_INVALID_ARGUMENT,
+		CHECK(pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers) == PYROWAVE_ERROR_INVALID_ARGUMENT,
 		      "NULL plane accepted");
 
 		CHECK(pyrowave_decoder_decode(decoder, nullptr, &buffers) == PYROWAVE_ERROR_INVALID_ARGUMENT,
 		      "NULL command buffer accepted");
 
-		for (auto *plane : planes)
-			plane->release();
 		pyrowave_decoder_destroy(decoder);
 	}
 
@@ -668,34 +659,30 @@ int main()
 		pyrowave_decoder decoder = nullptr;
 		CHECK(pyrowave_decoder_create(&info, &decoder) == PYROWAVE_SUCCESS, "create failed");
 
-		MTL::Texture *planes[3] = {
+		id<MTLTexture> planes[3] = {
 			make_plane(mtl, 640, 480), make_plane(mtl, 320, 240), make_plane(mtl, 320, 240),
 		};
 		pyrowave_gpu_buffers buffers = {};
 		for (int i = 0; i < 3; i++)
-			buffers.planes[i] = planes[i];
+			buffers.planes[i] = (__bridge void *)planes[i];
 
-		std::vector<MTL::CommandBuffer *> pending;
+		std::vector<id<MTLCommandBuffer> > pending;
 		for (int i = 0; i < 30; i++)
 		{
 			pyrowave_decoder_clear(decoder);
-			auto *cmd = queue->commandBuffer();
-			cmd->retain();
-			CHECK(pyrowave_decoder_decode(decoder, cmd, &buffers) == PYROWAVE_SUCCESS,
+			auto cmd = [queue commandBuffer];
+			CHECK(pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers) == PYROWAVE_SUCCESS,
 			      "decode %d failed", i);
-			cmd->commit();
+			[cmd commit];
 			pending.push_back(cmd);
 		}
 		for (auto *cmd : pending)
 		{
-			cmd->waitUntilCompleted();
-			CHECK(cmd->status() == MTL::CommandBufferStatusCompleted, "frame status %d", int(cmd->status()));
-			cmd->release();
+			[cmd waitUntilCompleted];
+			CHECK(cmd.status == MTLCommandBufferStatusCompleted, "frame status %d", int(cmd.status));
 		}
 		check_plane(planes[0], "reuse", 0);
 
-		for (auto *plane : planes)
-			plane->release();
 		pyrowave_decoder_destroy(decoder);
 	}
 
@@ -753,21 +740,21 @@ int main()
 		CHECK(pyrowave_decoder_decode_is_ready(decoder, false),
 		      "frame with every block coded should be ready");
 
-		MTL::Texture *planes[3] = {
+		id<MTLTexture> planes[3] = {
 			make_plane(mtl, W, H), make_plane(mtl, W / 2, H / 2), make_plane(mtl, W / 2, H / 2),
 		};
 		pyrowave_gpu_buffers buffers = {};
 		for (int i = 0; i < 3; i++)
-			buffers.planes[i] = planes[i];
+			buffers.planes[i] = (__bridge void *)planes[i];
 
-		auto *cmd = queue->commandBuffer();
-		CHECK(pyrowave_decoder_decode(decoder, cmd, &buffers) == PYROWAVE_SUCCESS, "decode failed");
-		cmd->commit();
-		cmd->waitUntilCompleted();
-		CHECK(cmd->status() == MTL::CommandBufferStatusCompleted, "status %d", int(cmd->status()));
-		if (cmd->error())
+		auto cmd = [queue commandBuffer];
+		CHECK(pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers) == PYROWAVE_SUCCESS, "decode failed");
+		[cmd commit];
+		[cmd waitUntilCompleted];
+		CHECK(cmd.status == MTLCommandBufferStatusCompleted, "status %d", int(cmd.status));
+		if (cmd.error)
 		{
-			printf("FAIL GPU error: %s\n", cmd->error()->localizedDescription()->utf8String());
+			printf("FAIL GPU error: %s\n", cmd.error.localizedDescription.UTF8String);
 			g_failures++;
 		}
 
@@ -777,8 +764,6 @@ int main()
 		for (int i = 0; i < 3; i++)
 			check_plane(planes[i], "coded-empty-ballot", i);
 
-		for (auto *plane : planes)
-			plane->release();
 		pyrowave_decoder_destroy(decoder);
 	}
 
@@ -921,10 +906,7 @@ int main()
 		pyrowave_encoder_destroy(encoder);
 	}
 
-	queue->release();
 	pyrowave_device_destroy(device);
-	mtl->release();
-	pool->release();
 
 	if (g_failures)
 		printf("\n%d FAILURE(S)\n", g_failures);

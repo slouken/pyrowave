@@ -1,8 +1,6 @@
 // Measures the marginal cost of a compute dispatch by sweeping dispatch count
 // with a trivial kernel, serial vs concurrent encoder. Slope = per-dispatch cost.
-#define NS_PRIVATE_IMPLEMENTATION
-#define MTL_PRIVATE_IMPLEMENTATION
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 #include <algorithm>
 #include <stdio.h>
 #include <vector>
@@ -19,13 +17,13 @@ kernel void nop(device uint *out [[buffer(0)]],
 )";
 
 int main(){
-    auto *dev = MTL::CreateSystemDefaultDevice();
-    NS::Error *err=nullptr;
-    auto *lib = dev->newLibrary(NS::String::string(src, NS::UTF8StringEncoding), nullptr, &err);
-    auto *fn = lib->newFunction(NS::String::string("nop", NS::UTF8StringEncoding));
-    auto *pipe = dev->newComputePipelineState(fn, &err);
-    auto *buf = dev->newBuffer(4096*4, MTL::ResourceStorageModePrivate);
-    auto *q = dev->newCommandQueue();
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    NSError *err=nil;
+    auto lib = [dev newLibraryWithSource:@(src) options:nil error:&err];
+    auto fn = [lib newFunctionWithName:@"nop"];
+    auto pipe = [dev newComputePipelineStateWithFunction:fn error:&err];
+    auto buf = [dev newBufferWithLength:4096*4 options:MTLResourceStorageModePrivate];
+    auto q = [dev newCommandQueue];
 
     printf("%-10s %14s %14s\n", "dispatches", "serial (ms)", "concurrent (ms)");
     std::vector<int> counts = {1, 10, 20, 40, 80, 160};
@@ -35,21 +33,19 @@ int main(){
         double best[2] = {1e9, 1e9};
         for (int mode=0; mode<2; mode++) {
             for (int rep=0; rep<80; rep++) {
-                auto *pool = NS::AutoreleasePool::alloc()->init();
-                auto *cb = q->commandBuffer();
-                auto *enc = mode==0 ? cb->computeCommandEncoder()
-                                    : cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
-                enc->setComputePipelineState(pipe);
-                enc->setBuffer(buf, 0, 0);
+                auto cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> enc = mode==0 ? [cb computeCommandEncoder]
+                                    : [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                [enc setComputePipelineState:pipe];
+                [enc setBuffer:buf offset:0 atIndex:0];
                 for (int i=0;i<n;i++) {
                     uint32_t slot = i;
-                    enc->setBytes(&slot, sizeof(slot), 1);
-                    enc->dispatchThreadgroups(MTL::Size(1,1,1), MTL::Size(64,1,1));
+                    [enc setBytes:&slot length:sizeof(slot) atIndex:1];
+                    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(64,1,1)];
                 }
-                enc->endEncoding();
-                cb->commit(); cb->waitUntilCompleted();
-                if (rep>=20) best[mode] = std::min(best[mode], (cb->GPUEndTime()-cb->GPUStartTime())*1000.0);
-                pool->release();
+                [enc endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                if (rep>=20) best[mode] = std::min(best[mode], (cb.GPUEndTime-cb.GPUStartTime)*1000.0);
             }
         }
         printf("%-10d %14.4f %14.4f\n", n, best[0], best[1]);

@@ -14,7 +14,7 @@
 // Metal objects cross the ABI as void *. This keeps the header usable from plain C,
 // Objective-C and C++ alike, and sidesteps ARC ownership ambiguity at the boundary:
 //   - Objective-C / ARC: pass (__bridge void *)mtlObject
-//   - C++ / metal-cpp:   pass the MTL::Object * directly
+//   - Objective-C, no ARC, or plain C: pass the object pointer directly
 // Unless stated otherwise, objects passed in are retained for as long as PyroWave
 // needs them and released on destroy, so the caller may release its own reference.
 

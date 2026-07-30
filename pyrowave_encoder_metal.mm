@@ -15,7 +15,7 @@
 #include "pyrowave_metal_common.hpp"
 #include "shaders/metal/pyrowave_msl.h"
 
-#include <IOSurface/IOSurfaceRef.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include <algorithm>
 #include <cmath>
@@ -180,10 +180,10 @@ constexpr bool bench_serial_dispatch()
 // A serial encoder already orders every dispatch against the previous one, so the
 // explicit barriers are only needed, and only legal, on a concurrent encoder.
 // Outside a benchmark build this folds away and the barrier is unconditional.
-void stage_barrier(MTL::ComputeCommandEncoder *enc, MTL::BarrierScope scope)
+void stage_barrier(id<MTLComputeCommandEncoder> enc, MTLBarrierScope scope)
 {
 	if (!bench_serial_dispatch())
-		enc->memoryBarrier(scope);
+		[enc memoryBarrierWithScope:scope];
 }
 
 uint32_t floor_log2(uint32_t v)
@@ -202,11 +202,11 @@ uint32_t floor_log2(uint32_t v)
 // objects to release are tracked separately from the sampled views.
 struct InputTextures
 {
-	MTL::Texture *sampled[NumComponents] = {};
-	MTL::Texture *owned[4] = {};
+	id<MTLTexture> sampled[NumComponents] = {};
+	id<MTLTexture> owned[4] = {};
 	int num_owned = 0;
 
-	MTL::Texture *adopt(MTL::Texture *texture)
+	id<MTLTexture> adopt(id<MTLTexture> texture)
 	{
 		if (texture)
 			owned[num_owned++] = texture;
@@ -215,11 +215,9 @@ struct InputTextures
 
 	void release_all()
 	{
-		for (int i = 0; i < num_owned; i++)
-			owned[i]->release();
 		num_owned = 0;
-		for (auto *&texture : sampled)
-			texture = nullptr;
+		for (int i = 0; i < NumComponents; i++)
+			sampled[i] = nil;
 	}
 
 	~InputTextures() { release_all(); }
@@ -236,18 +234,18 @@ struct pyrowave_encoder_opaque
 	BlockLayout layout;
 	WaveletPyramid wavelet;
 
-	MTL::CommandQueue *queue = nullptr;
+	id<MTLCommandQueue> queue;
 
 	// Device local scratch, sized once from the block layout.
-	MTL::Buffer *bucket_buffer = nullptr;
-	MTL::Buffer *meta_buffer = nullptr;
-	MTL::Buffer *block_stat_buffer = nullptr;
-	MTL::Buffer *payload_data = nullptr;
-	MTL::Buffer *quant_buffer = nullptr;
+	id<MTLBuffer> bucket_buffer;
+	id<MTLBuffer> meta_buffer;
+	id<MTLBuffer> block_stat_buffer;
+	id<MTLBuffer> payload_data;
+	id<MTLBuffer> quant_buffer;
 
 	// Results. Shared storage so the packet queries can read them without a copy.
-	MTL::Buffer *bitstream_meta = nullptr;
-	MTL::Buffer *bitstream = nullptr;
+	id<MTLBuffer> bitstream_meta;
+	id<MTLBuffer> bitstream;
 
 	// Input textures for the CPU entry point, reused across frames. The GPU entry
 	// point wraps the caller's IOSurfaces per call instead.
@@ -256,7 +254,7 @@ struct pyrowave_encoder_opaque
 
 	// Retained until the next encode replaces it, so the packet queries have
 	// something to block on.
-	MTL::CommandBuffer *pending = nullptr;
+	id<MTLCommandBuffer> pending;
 	bool have_result = false;
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
@@ -266,24 +264,9 @@ struct pyrowave_encoder_opaque
 
 	uint32_t sequence_count = 0;
 
-	~pyrowave_encoder_opaque()
-	{
-		MTL::Buffer *const buffers[] = {
-			bucket_buffer, meta_buffer, block_stat_buffer, payload_data, quant_buffer,
-			bitstream_meta, bitstream,
-		};
-
-		for (auto *buffer : buffers)
-			if (buffer)
-				buffer->release();
-
-		// Metal keeps anything a command buffer references alive on its own, so an
-		// in-flight encode does not have to be waited out here.
-		if (pending)
-			pending->release();
-		if (queue)
-			queue->release();
-	}
+	// No destructor needed: ARC releases every buffer, the queue and any pending
+	// command buffer, and Metal keeps anything a command buffer still references
+	// alive on its own, so an in-flight encode does not have to be waited out.
 };
 
 namespace
@@ -326,7 +309,6 @@ bool ensure_encode_pipelines(pyrowave_device device)
 			device->dwt_pipeline[i] = create_pipeline_bool_constant(
 					device, library, "pyrowave_dwt", DwtThreadgroupSize, 0, i != 0);
 		}
-		library->release();
 	}
 
 	// SkipQuantScale is function constant 1 and wants its default of false, but
@@ -336,12 +318,11 @@ bool ensure_encode_pipelines(pyrowave_device device)
 	{
 		device->quant_pipeline = create_pipeline_bool_constant(
 				device, library, "pyrowave_wavelet_quant", QuantThreadgroupSize, 1, false);
-		library->release();
 	}
 
 	struct
 	{
-		MTL::ComputePipelineState **pipeline;
+		__strong id<MTLComputePipelineState> *pipeline;
 		const char *source;
 		const char *entry_point;
 		uint32_t threads;
@@ -359,7 +340,6 @@ bool ensure_encode_pipelines(pyrowave_device device)
 		if (auto *library = compile_library(device, shader.source, shader.entry_point))
 		{
 			*shader.pipeline = create_pipeline(device, library, shader.entry_point, shader.threads);
-			library->release();
 		}
 	}
 
@@ -369,15 +349,13 @@ bool ensure_encode_pipelines(pyrowave_device device)
 	if (auto *library = compile_library(device, resolve_rate_control_msl_source, "resolve_rate_control"))
 	{
 		uint32_t threadgroup_size = ResolveThreadgroupSize;
-		auto *constants = MTL::FunctionConstantValues::alloc()->init();
-		constants->setConstantValue(&threadgroup_size, MTL::DataTypeUInt, NS::UInteger(0));
+		auto constants = [MTLFunctionConstantValues new];
+		[constants setConstantValue:&threadgroup_size type:MTLDataTypeUInt atIndex:0];
 		device->resolve_pipeline = create_pipeline(device, library, "pyrowave_resolve_rate_control",
 		                                           ResolveThreadgroupSize, constants);
-		constants->release();
-		library->release();
 	}
 
-	MTL::ComputePipelineState *const required[] = {
+	id<MTLComputePipelineState> const required[] = {
 		device->dwt_pipeline[0], device->dwt_pipeline[1], device->quant_pipeline,
 		device->analyze_pipeline, device->analyze_finalize_pipeline,
 		device->resolve_pipeline, device->block_packing_pipeline,
@@ -387,26 +365,25 @@ bool ensure_encode_pipelines(pyrowave_device device)
 		if (!pipeline)
 			return false;
 
-	if (device->resolve_pipeline->threadExecutionWidth() != ResolveThreadgroupSize)
+	if (device->resolve_pipeline.threadExecutionWidth != ResolveThreadgroupSize)
 	{
 		device->log("resolve_rate_control needs a SIMD width of %u, but the device reports %u.",
 		            ResolveThreadgroupSize,
-		            unsigned(device->resolve_pipeline->threadExecutionWidth()));
+		            unsigned(device->resolve_pipeline.threadExecutionWidth));
 		return false;
 	}
 
 	// The quantizer samples with a border so coefficients past the edge of a band
 	// read as zero, rather than the DWT's mirror repeat.
-	auto *sampler_desc = MTL::SamplerDescriptor::alloc()->init();
-	sampler_desc->setMinFilter(MTL::SamplerMinMagFilterNearest);
-	sampler_desc->setMagFilter(MTL::SamplerMinMagFilterNearest);
-	sampler_desc->setMipFilter(MTL::SamplerMipFilterNearest);
-	sampler_desc->setSAddressMode(MTL::SamplerAddressModeClampToBorderColor);
-	sampler_desc->setTAddressMode(MTL::SamplerAddressModeClampToBorderColor);
-	sampler_desc->setRAddressMode(MTL::SamplerAddressModeClampToBorderColor);
-	sampler_desc->setBorderColor(MTL::SamplerBorderColorTransparentBlack);
-	device->border_sampler = device->mtl->newSamplerState(sampler_desc);
-	sampler_desc->release();
+	auto sampler_desc = [MTLSamplerDescriptor new];
+	sampler_desc.minFilter = MTLSamplerMinMagFilterNearest;
+	sampler_desc.magFilter = MTLSamplerMinMagFilterNearest;
+	sampler_desc.mipFilter = MTLSamplerMipFilterNearest;
+	sampler_desc.sAddressMode = MTLSamplerAddressModeClampToBorderColor;
+	sampler_desc.tAddressMode = MTLSamplerAddressModeClampToBorderColor;
+	sampler_desc.rAddressMode = MTLSamplerAddressModeClampToBorderColor;
+	sampler_desc.borderColor = MTLSamplerBorderColorTransparentBlack;
+	device->border_sampler = [device->mtl newSamplerStateWithDescriptor:sampler_desc];
 
 	if (!device->border_sampler)
 		return false;
@@ -415,16 +392,16 @@ bool ensure_encode_pipelines(pyrowave_device device)
 	return true;
 }
 
-MTL::Buffer *create_scratch_buffer(pyrowave_device device, size_t size, MTL::ResourceOptions options,
+id<MTLBuffer> create_scratch_buffer(pyrowave_device device, size_t size, MTLResourceOptions options,
                                    const char *label)
 {
-	auto *buffer = device->mtl->newBuffer(size, options);
+	auto buffer = [device->mtl newBufferWithLength:size options:options];
 	if (!buffer)
 	{
 		device->log("Failed to allocate a %zu byte %s buffer.", size, label);
 		return nullptr;
 	}
-	buffer->setLabel(NS::String::string(label, NS::UTF8StringEncoding));
+	buffer.label = @(label);
 	return buffer;
 }
 
@@ -435,7 +412,7 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 
 	struct
 	{
-		MTL::Buffer **buffer;
+		__strong id<MTLBuffer> *buffer;
 		size_t size;
 		const char *label;
 	} const scratch[] = {
@@ -455,14 +432,14 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 	for (auto &entry : scratch)
 	{
 		*entry.buffer = create_scratch_buffer(device, entry.size,
-		                                      MTL::ResourceStorageModePrivate, entry.label);
+		                                      MTLResourceStorageModePrivate, entry.label);
 		if (!*entry.buffer)
 			return false;
 	}
 
 	encoder->bitstream_meta = create_scratch_buffer(
 			device, size_t(layout.block_count_32x32) * sizeof(BitstreamPacket),
-			MTL::ResourceStorageModeShared, "pyrowave-bitstream-meta");
+			MTLResourceStorageModeShared, "pyrowave-bitstream-meta");
 
 	return encoder->bitstream_meta != nullptr;
 }
@@ -472,33 +449,30 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 // keeps a buffer alive as long as a command buffer references it.
 bool ensure_bitstream_buffer(pyrowave_encoder encoder, size_t size)
 {
-	if (encoder->bitstream && encoder->bitstream->length() >= size)
+	if (encoder->bitstream && encoder->bitstream.length >= size)
 		return true;
 
-	if (encoder->bitstream)
-		encoder->bitstream->release();
 
 	encoder->bitstream = create_scratch_buffer(encoder->device, size,
-	                                           MTL::ResourceStorageModeShared, "pyrowave-bitstream");
+	                                           MTLResourceStorageModeShared, "pyrowave-bitstream");
 	return encoder->bitstream != nullptr;
 }
 
-MTL::Texture *create_input_texture(pyrowave_device device, MTL::PixelFormat format,
+id<MTLTexture> create_input_texture(pyrowave_device device, MTLPixelFormat format,
                                    int width, int height, bool needs_view)
 {
-	auto *desc = MTL::TextureDescriptor::alloc()->init();
-	desc->setTextureType(MTL::TextureType2D);
-	desc->setPixelFormat(format);
-	desc->setWidth(width);
-	desc->setHeight(height);
-	desc->setUsage(MTL::TextureUsageShaderRead |
-	               (needs_view ? MTL::TextureUsagePixelFormatView : 0));
+	auto desc = [MTLTextureDescriptor new];
+	desc.textureType = MTLTextureType2D;
+	desc.pixelFormat = format;
+	desc.width = width;
+	desc.height = height;
+	desc.usage = MTLTextureUsageShaderRead |
+	               (needs_view ? MTLTextureUsagePixelFormatView : 0);
 	// Written by the CPU, and IOSurface backed textures cannot be private anyway.
-	desc->setStorageMode(MTL::StorageModeShared);
-	desc->setMipmapLevelCount(1);
+	desc.storageMode = MTLStorageModeShared;
+	desc.mipmapLevelCount = 1;
 
-	auto *texture = device->mtl->newTexture(desc);
-	desc->release();
+	auto texture = [device->mtl newTextureWithDescriptor:desc];
 
 	if (!texture)
 		device->log("Failed to allocate a %dx%d input texture.", width, height);
@@ -506,21 +480,20 @@ MTL::Texture *create_input_texture(pyrowave_device device, MTL::PixelFormat form
 	return texture;
 }
 
-MTL::Texture *wrap_surface_plane(pyrowave_device device, IOSurfaceRef surface, int plane,
-                                 MTL::PixelFormat format, int width, int height, bool needs_view)
+id<MTLTexture> wrap_surface_plane(pyrowave_device device, IOSurfaceRef surface, int plane,
+                                 MTLPixelFormat format, int width, int height, bool needs_view)
 {
-	auto *desc = MTL::TextureDescriptor::alloc()->init();
-	desc->setTextureType(MTL::TextureType2D);
-	desc->setPixelFormat(format);
-	desc->setWidth(width);
-	desc->setHeight(height);
-	desc->setUsage(MTL::TextureUsageShaderRead |
-	               (needs_view ? MTL::TextureUsagePixelFormatView : 0));
-	desc->setStorageMode(MTL::StorageModeShared);
-	desc->setMipmapLevelCount(1);
+	auto desc = [MTLTextureDescriptor new];
+	desc.textureType = MTLTextureType2D;
+	desc.pixelFormat = format;
+	desc.width = width;
+	desc.height = height;
+	desc.usage = MTLTextureUsageShaderRead |
+	               (needs_view ? MTLTextureUsagePixelFormatView : 0);
+	desc.storageMode = MTLStorageModeShared;
+	desc.mipmapLevelCount = 1;
 
-	auto *texture = device->mtl->newTexture(desc, surface, NS::UInteger(plane));
-	desc->release();
+	id<MTLTexture> texture = [device->mtl newTextureWithDescriptor:desc iosurface:surface plane:plane];
 
 	if (!texture)
 		device->log("Failed to wrap plane %d of the input IOSurface.", plane);
@@ -533,16 +506,14 @@ MTL::Texture *wrap_surface_plane(pyrowave_device device, IOSurfaceRef surface, i
 // the Vulkan API documents for NV12 too ("pass in the same plane for Cb and Cr,
 // but use swizzle"). Note an R8 format view of an RG8 texture is impossible, 8
 // versus 16 bits per pixel, so the format stays and only the swizzle changes.
-bool make_interleaved_chroma_views(pyrowave_device device, InputTextures &input, MTL::Texture *chroma)
+bool make_interleaved_chroma_views(pyrowave_device device, InputTextures &input, id<MTLTexture> chroma)
 {
-	static const MTL::TextureSwizzle components[2] = { MTL::TextureSwizzleRed, MTL::TextureSwizzleGreen };
+	static const MTLTextureSwizzle components[2] = { MTLTextureSwizzleRed, MTLTextureSwizzleGreen };
 
 	for (int i = 0; i < 2; i++)
 	{
 		const auto c = components[i];
-		input.sampled[i + 1] = input.adopt(chroma->newTextureView(
-				chroma->pixelFormat(), MTL::TextureType2D, NS::Range(0, 1), NS::Range(0, 1),
-				MTL::TextureSwizzleChannels::Make(c, c, c, c)));
+		input.sampled[i + 1] = input.adopt([chroma newTextureViewWithPixelFormat:chroma.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:MTLTextureSwizzleChannelsMake(c, c, c, c)]);
 
 		if (!input.sampled[i + 1])
 		{
@@ -571,14 +542,14 @@ bool ensure_cpu_input(pyrowave_encoder encoder, pyrowave_cpu_buffer_format forma
 	const int chroma_width = chroma_420 ? layout.width / 2 : layout.width;
 	const int chroma_height = chroma_420 ? layout.height / 2 : layout.height;
 
-	input.sampled[0] = input.adopt(create_input_texture(device, MTL::PixelFormatR8Unorm,
+	input.sampled[0] = input.adopt(create_input_texture(device, MTLPixelFormatR8Unorm,
 	                                                    layout.width, layout.height, false));
 	if (!input.sampled[0])
 		return false;
 
 	if (format == PYROWAVE_CPU_BUFFER_FORMAT_NV12)
 	{
-		auto *chroma = input.adopt(create_input_texture(device, MTL::PixelFormatRG8Unorm,
+		auto *chroma = input.adopt(create_input_texture(device, MTLPixelFormatRG8Unorm,
 		                                                chroma_width, chroma_height, true));
 		if (!chroma || !make_interleaved_chroma_views(device, input, chroma))
 			return false;
@@ -587,7 +558,7 @@ bool ensure_cpu_input(pyrowave_encoder encoder, pyrowave_cpu_buffer_format forma
 	{
 		for (int i = 1; i < NumComponents; i++)
 		{
-			input.sampled[i] = input.adopt(create_input_texture(device, MTL::PixelFormatR8Unorm,
+			input.sampled[i] = input.adopt(create_input_texture(device, MTLPixelFormatR8Unorm,
 			                                                    chroma_width, chroma_height, false));
 			if (!input.sampled[i])
 				return false;
@@ -601,21 +572,21 @@ bool ensure_cpu_input(pyrowave_encoder encoder, pyrowave_cpu_buffer_format forma
 //////
 // GPU dispatch, one function per stage of pyrowave_encoder.cpp's pipeline.
 
-void dispatch_dwt(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc,
-                MTL::Texture *const planes[NumComponents])
+void dispatch_dwt(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc,
+                id<MTLTexture> const planes[NumComponents])
 {
 	const auto &layout = encoder->layout;
 	auto &wavelet = encoder->wavelet;
 	const bool chroma_420 = layout.chroma == ChromaSubsampling::Chroma420;
 
-	enc->setSamplerState(encoder->device->mirror_repeat_sampler, 0);
+	[enc setSamplerState:encoder->device->mirror_repeat_sampler atIndex:0];
 
 	for (int output_level = 0; output_level < DecompositionLevels; output_level++)
 	{
 		// Each level transforms the LL band the previous one produced, so the levels
 		// are a dependent chain. The components within a level are independent.
 		if (output_level != 0)
-			stage_barrier(enc, MTL::BarrierScopeTextures);
+			stage_barrier(enc, MTLBarrierScopeTextures);
 
 		DwtPush level_push = {};
 		if (output_level == 0)
@@ -642,7 +613,7 @@ void dispatch_dwt(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc,
 		for (int component = 0; component < components; component++)
 		{
 			DwtPush push = level_push;
-			MTL::Texture *input;
+			id<MTLTexture> input;
 			// DCShift subtracts 0.5 to centre unorm input on zero, so it applies
 			// exactly when the source is an input plane rather than a previous level.
 			bool reads_input_plane = output_level == 0;
@@ -668,16 +639,14 @@ void dispatch_dwt(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc,
 			push.inv_resolution[0] = 1.0f / float(push.resolution[0]);
 			push.inv_resolution[1] = 1.0f / float(push.resolution[1]);
 
-			enc->setComputePipelineState(encoder->device->dwt_pipeline[reads_input_plane ? 1 : 0]);
-			enc->setBytes(&push, sizeof(push), 0);
-			enc->setTexture(input, 0);
-			enc->setTexture(wavelet.component_layer_views[component][output_level], 1);
+			[enc setComputePipelineState:encoder->device->dwt_pipeline[reads_input_plane ? 1 : 0]];
+			[enc setBytes:&push length:sizeof(push) atIndex:0];
+			[enc setTexture:input atIndex:0];
+			[enc setTexture:wavelet.component_layer_views[component][output_level] atIndex:1];
 
 			// Each threadgroup consumes a 32x32 source tile.
-			enc->dispatchThreadgroups(
-					MTL::Size((push.aligned_resolution[0] + 31) / 32,
-					          (push.aligned_resolution[1] + 31) / 32, 1),
-					MTL::Size(DwtThreadgroupSize, 1, 1));
+			[enc dispatchThreadgroups:MTLSizeMake((push.aligned_resolution[0] + 31) / 32,
+					          (push.aligned_resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(DwtThreadgroupSize, 1, 1)];
 		}
 	}
 }
@@ -701,16 +670,16 @@ void for_each_band(const BlockLayout &layout, Op op)
 	}
 }
 
-void dispatch_quant(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc)
+void dispatch_quant(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 {
 	const auto &layout = encoder->layout;
 	const int precision = encoder->device->precision;
 
-	enc->setComputePipelineState(encoder->device->quant_pipeline);
-	enc->setBuffer(encoder->meta_buffer, 0, 1);
-	enc->setBuffer(encoder->block_stat_buffer, 0, 2);
-	enc->setBuffer(encoder->payload_data, 0, 3);
-	enc->setSamplerState(encoder->device->border_sampler, 0);
+	[enc setComputePipelineState:encoder->device->quant_pipeline];
+	[enc setBuffer:encoder->meta_buffer offset:0 atIndex:1];
+	[enc setBuffer:encoder->block_stat_buffer offset:0 atIndex:2];
+	[enc setBuffer:encoder->payload_data offset:0 atIndex:3];
+	[enc setSamplerState:encoder->device->border_sampler atIndex:0];
 
 	for_each_band(layout, [&](int level, int component, int band) {
 		QuantPush push = {};
@@ -734,22 +703,20 @@ void dispatch_quant(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc)
 		push.block_offset = layout.block_meta[component][level][band].block_offset_8x8;
 		push.block_stride = layout.block_meta[component][level][band].block_stride_8x8;
 
-		enc->setTexture(encoder->wavelet.component_layer_views[component][level], 0);
-		enc->setBytes(&push, sizeof(push), 0);
-		enc->dispatchThreadgroups(
-				MTL::Size((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1),
-				MTL::Size(QuantThreadgroupSize, 1, 1));
+		[enc setTexture:encoder->wavelet.component_layer_views[component][level] atIndex:0];
+		[enc setBytes:&push length:sizeof(push) atIndex:0];
+		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(QuantThreadgroupSize, 1, 1)];
 	});
 }
 
-void dispatch_analyze_rdo(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc)
+void dispatch_analyze_rdo(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 {
 	const auto &layout = encoder->layout;
 	const int per_subdivision = compute_block_count_per_subdivision(layout.block_count_32x32);
 
-	enc->setComputePipelineState(encoder->device->analyze_pipeline);
-	enc->setBuffer(encoder->bucket_buffer, 0, 0);
-	enc->setBuffer(encoder->block_stat_buffer, 0, 2);
+	[enc setComputePipelineState:encoder->device->analyze_pipeline];
+	[enc setBuffer:encoder->bucket_buffer offset:0 atIndex:0];
+	[enc setBuffer:encoder->block_stat_buffer offset:0 atIndex:2];
 
 	for_each_band(layout, [&](int level, int component, int band) {
 		AnalyzePush push = {};
@@ -767,21 +734,18 @@ void dispatch_analyze_rdo(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *
 		push.num_blocks_aligned = uint32_t(per_subdivision * BlockSpaceSubdivision);
 		push.block_index_shamt = floor_log2(uint32_t(per_subdivision));
 
-		enc->setBytes(&push, sizeof(push), 1);
-		enc->dispatchThreadgroups(
-				MTL::Size((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1),
-				MTL::Size(AnalyzeThreadgroupSize, 1, 1));
+		[enc setBytes:&push length:sizeof(push) atIndex:1];
+		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(AnalyzeThreadgroupSize, 1, 1)];
 	});
 
 	// The finalize pass prefix sums the buckets the dispatches above filled.
-	stage_barrier(enc, MTL::BarrierScopeBuffers);
-	enc->setComputePipelineState(encoder->device->analyze_finalize_pipeline);
-	enc->setBuffer(encoder->bucket_buffer, 0, 0);
-	enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
-	                          MTL::Size(AnalyzeFinalizeThreadgroupSize, 1, 1));
+	stage_barrier(enc, MTLBarrierScopeBuffers);
+	[enc setComputePipelineState:encoder->device->analyze_finalize_pipeline];
+	[enc setBuffer:encoder->bucket_buffer offset:0 atIndex:0];
+	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(AnalyzeFinalizeThreadgroupSize, 1, 1)];
 }
 
-void dispatch_resolve_rdo(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc, size_t target_size)
+void dispatch_resolve_rdo(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc, size_t target_size)
 {
 	const auto &layout = encoder->layout;
 
@@ -794,27 +758,26 @@ void dispatch_resolve_rdo(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *
 	push.target_payload_size = uint32_t(target_size / sizeof(uint32_t));
 	push.num_blocks_per_subdivision = uint32_t(compute_block_count_per_subdivision(layout.block_count_32x32));
 
-	enc->setComputePipelineState(encoder->device->resolve_pipeline);
-	enc->setBuffer(encoder->bucket_buffer, 0, 0);
-	enc->setBytes(&push, sizeof(push), 1);
-	enc->setBuffer(encoder->quant_buffer, 0, 2);
-	enc->dispatchThreadgroups(MTL::Size(NumRDOBuckets * BlockSpaceSubdivision, 1, 1),
-	                          MTL::Size(ResolveThreadgroupSize, 1, 1));
+	[enc setComputePipelineState:encoder->device->resolve_pipeline];
+	[enc setBuffer:encoder->bucket_buffer offset:0 atIndex:0];
+	[enc setBytes:&push length:sizeof(push) atIndex:1];
+	[enc setBuffer:encoder->quant_buffer offset:0 atIndex:2];
+	[enc dispatchThreadgroups:MTLSizeMake(NumRDOBuckets * BlockSpaceSubdivision, 1, 1) threadsPerThreadgroup:MTLSizeMake(ResolveThreadgroupSize, 1, 1)];
 }
 
-void dispatch_block_packing(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc)
+void dispatch_block_packing(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 {
 	const auto &layout = encoder->layout;
 	const int precision = encoder->device->precision;
 
 	// SPIRV-Cross renumbered these; the GLSL binding order is 1, 6, 4, 0, 5, 3.
-	enc->setComputePipelineState(encoder->device->block_packing_pipeline);
-	enc->setBuffer(encoder->payload_data, 0, 0);
-	enc->setBuffer(encoder->bitstream, 0, 1);
-	enc->setBuffer(encoder->quant_buffer, 0, 3);
-	enc->setBuffer(encoder->meta_buffer, 0, 4);
-	enc->setBuffer(encoder->block_stat_buffer, 0, 5);
-	enc->setBuffer(encoder->bitstream_meta, 0, 6);
+	[enc setComputePipelineState:encoder->device->block_packing_pipeline];
+	[enc setBuffer:encoder->payload_data offset:0 atIndex:0];
+	[enc setBuffer:encoder->bitstream offset:0 atIndex:1];
+	[enc setBuffer:encoder->quant_buffer offset:0 atIndex:3];
+	[enc setBuffer:encoder->meta_buffer offset:0 atIndex:4];
+	[enc setBuffer:encoder->block_stat_buffer offset:0 atIndex:5];
+	[enc setBuffer:encoder->bitstream_meta offset:0 atIndex:6];
 
 	for_each_band(layout, [&](int level, int component, int band) {
 		BlockPackingPush push = {};
@@ -836,17 +799,15 @@ void dispatch_block_packing(pyrowave_encoder encoder, MTL::ComputeCommandEncoder
 		push.block_offset_8x8 = meta.block_offset_8x8;
 		push.block_stride_8x8 = meta.block_stride_8x8;
 
-		enc->setBytes(&push, sizeof(push), 2);
+		[enc setBytes:&push length:sizeof(push) atIndex:2];
 		// Note the /2: unlike the other stages a threadgroup covers 2x2 of the
 		// 32x32 blocks, one per 16 lanes.
-		enc->dispatchThreadgroups(
-				MTL::Size((push.resolution_32x32_blocks[0] + 1) / 2,
-				          (push.resolution_32x32_blocks[1] + 1) / 2, 1),
-				MTL::Size(BlockPackingThreadgroupSize, 1, 1));
+		[enc dispatchThreadgroups:MTLSizeMake((push.resolution_32x32_blocks[0] + 1) / 2,
+				          (push.resolution_32x32_blocks[1] + 1) / 2, 1) threadsPerThreadgroup:MTLSizeMake(BlockPackingThreadgroupSize, 1, 1)];
 	});
 }
 
-pyrowave_result encode_frame(pyrowave_encoder encoder, MTL::Texture *const planes[NumComponents],
+pyrowave_result encode_frame(pyrowave_encoder encoder, id<MTLTexture> const planes[NumComponents],
                              const pyrowave_rate_control *rate_control)
 {
 	// Block packing writes u32 words, so round the budget down like the Vulkan
@@ -862,20 +823,20 @@ pyrowave_result encode_frame(pyrowave_encoder encoder, MTL::Texture *const plane
 
 	encoder->sequence_count = (encoder->sequence_count + 1) & SequenceCountMask;
 
-	auto *cmd = encoder->queue->commandBuffer();
+	id<MTLCommandBuffer> cmd = [encoder->queue commandBuffer];
 	if (!cmd)
 		return PYROWAVE_ERROR_GENERIC;
-	cmd->setLabel(NS::String::string("pyrowave encode", NS::UTF8StringEncoding));
+	cmd.label = @("pyrowave encode");
 
-	auto *blit = cmd->blitCommandEncoder();
+	auto blit = [cmd blitCommandEncoder];
 	if (!blit)
 		return PYROWAVE_ERROR_GENERIC;
 	// The payload allocation counters, the RDO buckets and the per block quant
 	// decisions are all accumulated into, so they start from zero. The rest of the
 	// payload buffer is fully overwritten by whatever is coded.
-	blit->fillBuffer(encoder->payload_data, NS::Range(0, 2 * sizeof(uint32_t)), 0);
-	blit->fillBuffer(encoder->bucket_buffer, NS::Range(0, encoder->bucket_buffer->length()), 0);
-	blit->fillBuffer(encoder->quant_buffer, NS::Range(0, encoder->quant_buffer->length()), 0);
+	[blit fillBuffer:encoder->payload_data range:NSMakeRange(0, 2 * sizeof(uint32_t)) value:0];
+	[blit fillBuffer:encoder->bucket_buffer range:NSMakeRange(0, encoder->bucket_buffer.length) value:0];
+	[blit fillBuffer:encoder->quant_buffer range:NSMakeRange(0, encoder->quant_buffer.length) value:0];
 	// A block's payload rarely ends on a word boundary, and the packer never writes
 	// the leftover bytes of its final word. They still go out on the wire, so clear
 	// them rather than shipping whatever this buffer last held.
@@ -886,38 +847,36 @@ pyrowave_result encode_frame(pyrowave_encoder encoder, MTL::Texture *const plane
 	// preserve bits outside the write mask, so those bits are leftover threadgroup
 	// memory. The decoder reads only as many sign bits as there are significant
 	// coefficients and ignores the rest; the Vulkan encoder behaves the same way.
-	blit->fillBuffer(encoder->bitstream, NS::Range(0, target_size + meta_size), 0);
-	blit->endEncoding();
+	[blit fillBuffer:encoder->bitstream range:NSMakeRange(0, target_size + meta_size) value:0];
+	[blit endEncoding];
 
 	// One concurrent encoder for the whole pipeline, with explicit barriers exactly
 	// where the Vulkan encoder has them. Everything between two barriers is
 	// mutually independent -- each dispatch owns a distinct (component, level, band)
 	// region -- and a serial encoder would barrier between all ~170 of them.
-	auto *enc = cmd->computeCommandEncoder(bench_serial_dispatch() ? MTL::DispatchTypeSerial
-	                                                               : MTL::DispatchTypeConcurrent);
+	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoderWithDispatchType:
+			bench_serial_dispatch() ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
 	if (!enc)
 		return PYROWAVE_ERROR_GENERIC;
-	enc->setLabel(NS::String::string("pyrowave encode", NS::UTF8StringEncoding));
+	enc.label = @("pyrowave encode");
 
 	dispatch_dwt(encoder, enc, planes);
 	// The quantizer samples the coefficients the DWT just wrote.
-	stage_barrier(enc, MTL::BarrierScopeTextures);
+	stage_barrier(enc, MTLBarrierScopeTextures);
 	dispatch_quant(encoder, enc);
 	// Rate control analysis reads the per block statistics and payload sizes.
-	stage_barrier(enc, MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTLBarrierScopeBuffers);
 	dispatch_analyze_rdo(encoder, enc);
-	stage_barrier(enc, MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTLBarrierScopeBuffers);
 	dispatch_resolve_rdo(encoder, enc, target_size);
 	// Packing needs the quant decisions resolve just made.
-	stage_barrier(enc, MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTLBarrierScopeBuffers);
 	dispatch_block_packing(encoder, enc);
 
-	enc->endEncoding();
-	cmd->commit();
+	[enc endEncoding];
+	[cmd commit];
 
-	if (encoder->pending)
-		encoder->pending->release();
-	encoder->pending = cmd->retain();
+	encoder->pending = cmd;
 	encoder->have_result = true;
 
 	return PYROWAVE_SUCCESS;
@@ -934,24 +893,23 @@ pyrowave_result wait_for_result(pyrowave_encoder encoder)
 
 	if (encoder->pending)
 	{
-		encoder->pending->waitUntilCompleted();
+		[encoder->pending waitUntilCompleted];
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
 		encoder->bench_last_gpu_ms =
-				(encoder->pending->GPUEndTime() - encoder->pending->GPUStartTime()) * 1000.0;
+				(encoder->pending.GPUEndTime - encoder->pending.GPUStartTime) * 1000.0;
 #endif
 
-		if (encoder->pending->status() == MTL::CommandBufferStatusError)
+		if (encoder->pending.status == MTLCommandBufferStatusError)
 		{
-			auto *error = encoder->pending->error();
+			auto *error = encoder->pending.error;
 			encoder->device->log("Encode command buffer failed: %s",
-			                     error && error->localizedDescription() ?
-			                     error->localizedDescription()->utf8String() : "unknown error");
+			                     error && error.localizedDescription ?
+			                     error.localizedDescription.UTF8String : "unknown error");
 			encoder->have_result = false;
 			return PYROWAVE_ERROR_GENERIC;
 		}
 
-		encoder->pending->release();
 		encoder->pending = nullptr;
 	}
 
@@ -1003,15 +961,14 @@ pyrowave_result upload_cpu_input(pyrowave_encoder encoder, const pyrowave_cpu_bu
 	// reading them. In practice this is free: the packet queries have already
 	// waited by the time a caller asks for another frame.
 	if (encoder->pending)
-		encoder->pending->waitUntilCompleted();
+		[encoder->pending waitUntilCompleted];
 
 	// Both NV12 chroma views alias owned[1], so upload through the backing objects
 	// rather than the sampled views.
 	for (int plane = 0; plane < num_planes; plane++)
 	{
 		auto *texture = encoder->cpu_input.owned[plane];
-		texture->replaceRegion(MTL::Region(0, 0, texture->width(), texture->height()),
-		                       0, input->data[plane], input->row_stride_in_bytes[plane]);
+		[texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height) mipmapLevel:0 withBytes:input->data[plane] bytesPerRow:input->row_stride_in_bytes[plane]];
 	}
 
 	return PYROWAVE_SUCCESS;
@@ -1087,10 +1044,10 @@ pyrowave_result wrap_gpu_input(pyrowave_encoder encoder, const pyrowave_gpu_inpu
 			return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
 		wrapped.sampled[0] = wrapped.adopt(wrap_surface_plane(
-				device, surface(0), 0, MTL::PixelFormatR8Unorm, layout.width, layout.height, false));
+				device, surface(0), 0, MTLPixelFormatR8Unorm, layout.width, layout.height, false));
 
 		auto *chroma = wrapped.adopt(wrap_surface_plane(
-				device, surface(0), 1, MTL::PixelFormatRG8Unorm, chroma_width, chroma_height, true));
+				device, surface(0), 1, MTLPixelFormatRG8Unorm, chroma_width, chroma_height, true));
 
 		if (!wrapped.sampled[0] || !chroma)
 			return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1109,7 +1066,7 @@ pyrowave_result wrap_gpu_input(pyrowave_encoder encoder, const pyrowave_gpu_inpu
 				return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
 			wrapped.sampled[i] = wrapped.adopt(wrap_surface_plane(
-					device, surface(i), 0, MTL::PixelFormatR8Unorm, width, height, false));
+					device, surface(i), 0, MTLPixelFormatR8Unorm, width, height, false));
 
 			if (!wrapped.sampled[i])
 				return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1119,10 +1076,6 @@ pyrowave_result wrap_gpu_input(pyrowave_encoder encoder, const pyrowave_gpu_inpu
 	return PYROWAVE_SUCCESS;
 }
 
-std::unique_ptr<NS::AutoreleasePool, void (*)(NS::AutoreleasePool *)> scoped_pool()
-{
-	return { NS::AutoreleasePool::alloc()->init(), [](NS::AutoreleasePool *p) { p->release(); } };
-}
 }
 
 //////
@@ -1146,7 +1099,6 @@ pyrowave_result pyrowave_encoder_create(const pyrowave_encoder_create_info *info
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 	}
 
-	auto pool = scoped_pool();
 
 	// Deferred rather than done in pyrowave_device_create(), so that decode-only
 	// users do not pay for six extra shader compiles.
@@ -1163,7 +1115,7 @@ pyrowave_result pyrowave_encoder_create(const pyrowave_encoder_create_info *info
 	                          chroma_420 ? ChromaSubsampling::Chroma420 : ChromaSubsampling::Chroma444))
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	created->queue = created->device->mtl->newCommandQueue();
+	created->queue = [created->device->mtl newCommandQueue];
 	if (!created->queue)
 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
 
@@ -1187,7 +1139,6 @@ pyrowave_result pyrowave_encoder_encode_gpu_synchronous(pyrowave_encoder encoder
 	if (!encoder || !input || !rate_control)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	auto pool = scoped_pool();
 
 	InputTextures wrapped;
 	auto result = wrap_gpu_input(encoder, input, wrapped);
@@ -1211,7 +1162,6 @@ pyrowave_result pyrowave_encoder_encode_cpu_synchronous(pyrowave_encoder encoder
 	    input->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV444P)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	auto pool = scoped_pool();
 
 	auto result = upload_cpu_input(encoder, input);
 	if (result != PYROWAVE_SUCCESS)
@@ -1230,7 +1180,7 @@ pyrowave_result pyrowave_encoder_compute_num_packets(pyrowave_encoder encoder, s
 	if (result != PYROWAVE_SUCCESS)
 		return result;
 
-	*num_packets = compute_num_packets(encoder->layout, encoder->bitstream_meta->contents(),
+	*num_packets = compute_num_packets(encoder->layout, encoder->bitstream_meta.contents,
 	                                   packet_boundary);
 	return PYROWAVE_SUCCESS;
 }
@@ -1250,7 +1200,7 @@ pyrowave_result pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_pa
 	static_assert(sizeof(pyrowave_packet) == sizeof(Packet), "pyrowave_packet layout mismatch.");
 	*out_packets = packetize(encoder->layout, reinterpret_cast<Packet *>(packets), packet_boundary,
 	                         bitstream, size,
-	                         encoder->bitstream_meta->contents(), encoder->bitstream->contents());
+	                         encoder->bitstream_meta.contents, encoder->bitstream.contents);
 	return PYROWAVE_SUCCESS;
 }
 

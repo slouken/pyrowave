@@ -1,6 +1,4 @@
-#define NS_PRIVATE_IMPLEMENTATION
-#define MTL_PRIVATE_IMPLEMENTATION
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 #include <CoreVideo/CoreVideo.h>
 #include <stdio.h>
 #include <string.h>
@@ -8,7 +6,7 @@
 
 int main() {
     const int W=640,H=480;
-    auto *dev = MTL::CreateSystemDefaultDevice();
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
 
     CFDictionaryRef io = CFDictionaryCreate(kCFAllocatorDefault,nullptr,nullptr,0,
         &kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
@@ -33,20 +31,20 @@ int main() {
     IOSurfaceRef s = CVPixelBufferGetIOSurface(pb);
     const int cw = W/2, ch = H/2;
 
-    auto *d = MTL::TextureDescriptor::alloc()->init();
-    d->setTextureType(MTL::TextureType2DArray);
-    d->setPixelFormat(MTL::PixelFormatR8Unorm);
-    d->setWidth(cw); d->setHeight(ch); d->setArrayLength(2);
-    d->setUsage(MTL::TextureUsageShaderRead);
-    auto *tex = dev->newTexture(d, s, 1);
-    d->release();
+    auto d = [MTLTextureDescriptor new];
+    d.textureType = MTLTextureType2DArray;
+    d.pixelFormat = MTLPixelFormatR8Unorm;
+    d.width = cw; d.height = ch; d.arrayLength = 2;
+    d.usage = MTLTextureUsageShaderRead;
+    auto tex = [dev newTextureWithDescriptor:d iosurface:s plane:1];
     if (!tex) { printf("array texture creation FAILED\n"); return 1; }
-    printf("array texture created: OK (storageMode=%d)\n", (int)tex->storageMode());
+    printf("array texture created: OK (storageMode=%d)\n", (int)tex.storageMode);
 
     std::vector<uint8_t> buf(size_t(cw)*ch);
     for (int slice = 0; slice < 2; slice++) {
         memset(buf.data(), 0, buf.size());
-        tex->getBytes(buf.data(), cw, cw*ch, MTL::Region(0,0,cw,ch), 0, slice);
+        [tex getBytes:buf.data() bytesPerRow:cw bytesPerImage:cw*ch
+         fromRegion:MTLRegionMake2D(0,0,cw,ch) mipmapLevel:0 slice:slice];
         // Summarise what came back.
         bool allA = true, allB = true, allZero = true;
         for (auto v : buf) { if (v!=0xAA) allA=false; if (v!=0xBB) allB=false; if (v!=0) allZero=false; }

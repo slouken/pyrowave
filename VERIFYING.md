@@ -95,6 +95,28 @@ decoders should read each other's streams, and decoding one stream with both at
 `PYROWAVE_PRECISION=2` should differ by tens of pixels, all off by one — about 30 over
 four frames at 480p.
 
+## Leaks and long running behaviour
+
+The backends are Objective-C++ under ARC, so this is where a missing
+`@autoreleasepool` or a stray strong reference would show up. Run after any change to
+object lifetime, resource creation or the entry points:
+
+```
+./tools/metal/build.sh
+build-tools/leak_test 3000              # encode + decode loop, footprint must stay flat
+build-tools/leak_test 400 --no-pool     # same without a caller pool
+leaks --atExit -- build-tools/leak_test 120
+```
+
+Measured at 1920x1080 4:2:0: footprint holds at **68.9 MB** with no growth over 3000
+frames, +0.2 MB over 400 with no caller pool at all, and `leaks` reports **0 leaks for
+0 total leaked bytes**. `--no-pool` mattering not at all is the point -- it means the
+library drains its own autoreleased objects rather than relying on the caller's pool.
+
+Object lifetime is separate from the frame loop: 60 create-and-destroy cycles of
+device, encoder and decoder together, each allocating ~27 MB of scratch, hold at
+5.8 MB.
+
 ## Under validation layers
 
 Run these before believing a change that touches resources or synchronization. Both

@@ -16,12 +16,12 @@ normal `PYROWAVE_DEVEL` target rather than one of these tools.
 `bench_encode` is the one tool that needs something from the library itself: the
 encoder owns its command buffer and never hands it out, so reading `GPUStartTime`
 or swapping the dispatch type has to happen inside the backend. Those two hooks sit
-behind `PYROWAVE_METAL_BENCH_HOOKS` in `pyrowave_encoder_metal.cpp` and are
+behind `PYROWAVE_METAL_BENCH_HOOKS` in `pyrowave_encoder_metal.mm` and are
 compiled out of every ordinary build; `build.sh` passes the define.
 
 ## Performance tools
 
-### `bench.cpp` — decoder GPU timing
+### `bench.mm` — decoder GPU timing
 Decodes the first frame of a stream repeatedly and reports GPU time from
 `GPUStartTime`/`GPUEndTime`, as min / p10 / median over 360 samples.
 
@@ -33,7 +33,7 @@ work; single medians vary enough to invent a 1.4x speedup that is not real. Ever
 performance claim in the commit messages comes from min-of-400 over three
 interleaved rounds.
 
-### `bench_encode.cpp` — encoder GPU timing, and the dispatch mode A/B
+### `bench_encode.mm` — encoder GPU timing, and the dispatch mode A/B
 Encodes a synthetic frame at six configurations and reports GPU time, the wall
 clock latency an application actually sees from the synchronous encode API, and the
 CPU cost of `packetize`. It also measures the concurrent compute encoder against a
@@ -57,7 +57,7 @@ completion notification, which the synchronous API cannot avoid.
 
 Serial against concurrent, GPU minimum: **2.47x at 640x480**, 1.81x at 720p, 1.44x
 at 1080p 4:2:0, 1.29x at 1080p 4:4:4, 1.14x at 4K. Same shape as the decoder, and
-the same cause — see `dispatch_cost.cpp` below.
+the same cause — see `dispatch_cost.mm` below.
 
 **Interleave the A/B inside one run.** Measuring the two dispatch modes in separate
 runs inflated the 480p speedup from 2.47x to 2.70x, purely from background load
@@ -71,7 +71,20 @@ which the DWT's gather reads care about. IOSurface still wins overall on wall cl
 1.653 against 2.407 ms, because the host path pays a 3 MB upload first — but
 zero-copy is not free here.
 
-### `dispatch_cost.cpp` — marginal cost of a compute dispatch
+### `leak_test.mm` — long running encode/decode footprint
+Encodes and decodes 1080p in a loop, sampling the process footprint as it goes. A flat
+trend means nothing is accumulating; `--no-pool` drops the per-iteration
+`@autoreleasepool` so anything the library autoreleases without draining shows up as
+growth rather than being hidden by the caller's pool.
+
+    build-tools/leak_test 3000
+    build-tools/leak_test 400 --no-pool
+    leaks --atExit -- build-tools/leak_test 120
+
+Holds at 68.9 MB over 3000 frames, +0.2 MB over 400 without a caller pool, and
+`leaks` reports zero.
+
+### `dispatch_cost.mm` — marginal cost of a compute dispatch
 Sweeps dispatch count with a trivial kernel, serial vs concurrent encoder. The
 slope is the per dispatch cost.
 
@@ -84,7 +97,7 @@ because each dispatch is far too small to fill the GPU on its own (the coarsest
 480p iDWT level is 12 threadgroups, 768 threads). That is why concurrency pays
 enormously at 480p and not at all at 1080p 4:4:4.
 
-### `counter_probe.cpp` — counter sampling support
+### `counter_probe.mm` — counter sampling support
 Prints which `MTLCounterSamplingPoint` values the device supports.
 
 On an M1: **only `AtStageBoundary`.** There is no dispatch boundary sampling, so
@@ -133,7 +146,7 @@ KosmicKrisp's shader codegen the rest.
 ### Reading the Vulkan numbers
 
 KosmicKrisp reports no timestamp support, so `write_timestamp` yields nothing and the
-repository root `bench.cpp` behind `pyrowave-bench` — not `tools/metal/bench.cpp` —
+repository root `bench.cpp` behind `pyrowave-bench` — not `tools/metal/bench.mm` —
 also wall clocks its loops. It reports four segments per frame, because a
 single bracket around the loop body cannot tell a busy CPU from one **blocked** inside
 `next_frame_context()` — Granite's frame contexts are a ring, so that call waits for an
@@ -189,7 +202,7 @@ there.
 These back the SDL Metal renderer change (per plane IOSurface texture
 properties). Keep them with any upstream bug report.
 
-### `iosurface_array_probe.cpp` — the silent aliasing bug
+### `iosurface_array_probe.mm` — the silent aliasing bug
 Fills plane 1 of a `y420` CVPixelBuffer with `0xAA` and plane 2 with `0xBB`, wraps
 plane 1 in the 2 layer array texture SDL uses for IYUV/YV12/P408/P416, and reads
 both slices back.
@@ -208,7 +221,7 @@ CVPixelBuffer.
 (`kCVReturnInvalidPixelFormat`). CoreVideo has no 3 plane 8-bit 4:4:4 format, so
 `SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER` cannot express P408 at all.
 
-### `iosurface_format_probe.cpp` — what Metal accepts per CV format
+### `iosurface_format_probe.mm` — what Metal accepts per CV format
 Enumerates 2D and array texture creation against several CVPixelBuffer formats.
 Note this one reports the array case as "OK" — that result is misleading, and
 `iosurface_array_probe` is what shows the data is wrong.

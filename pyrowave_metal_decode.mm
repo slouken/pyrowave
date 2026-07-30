@@ -10,7 +10,7 @@
 //
 // Frame dimensions and chroma mode are read from the bitstream's sequence header.
 
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 
 #include "pyrowave_metal.h"
 #include "pyrowave_bitstream.hpp"
@@ -29,7 +29,7 @@ namespace
 {
 struct Plane
 {
-	MTL::Texture *texture = nullptr;
+	id<MTLTexture> texture;
 	int width = 0;
 	int height = 0;
 	std::vector<uint8_t> pixels;
@@ -141,27 +141,25 @@ bool probe_sequence_header(const std::vector<uint8_t> &stream, int &width, int &
 	return false;
 }
 
-MTL::Texture *create_plane(MTL::Device *device, int width, int height)
+id<MTLTexture> create_plane(id<MTLDevice> device, int width, int height)
 {
-	auto *desc = MTL::TextureDescriptor::alloc()->init();
-	desc->setTextureType(MTL::TextureType2D);
+	auto desc = [MTLTextureDescriptor new];
+	desc.textureType = MTLTextureType2D;
 	// 8-bit unorm matches how the Vulkan decoder is normally consumed, and makes
 	// the readback directly comparable to a Y4M reference.
-	desc->setPixelFormat(MTL::PixelFormatR8Unorm);
-	desc->setWidth(width);
-	desc->setHeight(height);
-	desc->setUsage(MTL::TextureUsageShaderWrite | MTL::TextureUsageShaderRead);
-	desc->setStorageMode(MTL::StorageModeShared);
-	auto *texture = device->newTexture(desc);
-	desc->release();
+	desc.pixelFormat = MTLPixelFormatR8Unorm;
+	desc.width = width;
+	desc.height = height;
+	desc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+	desc.storageMode = MTLStorageModeShared;
+	auto texture = [device newTextureWithDescriptor:desc];
 	return texture;
 }
 
 void read_plane(Plane &plane)
 {
 	plane.pixels.resize(size_t(plane.width) * plane.height);
-	plane.texture->getBytes(plane.pixels.data(), plane.width,
-	                        MTL::Region(0, 0, plane.width, plane.height), 0);
+	[plane.texture getBytes:plane.pixels.data() bytesPerRow:plane.width fromRegion:MTLRegionMake2D(0, 0, plane.width, plane.height) mipmapLevel:0];
 }
 
 struct PlaneStats
@@ -245,24 +243,23 @@ int main(int argc, char **argv)
 	printf("Stream: %dx%d %s, %zu bytes (%s)\n", width, height, is_420 ? "420" : "444",
 	       stream.size(), containerized ? "PYROWAVE container" : "raw packets");
 
-	auto *pool = NS::AutoreleasePool::alloc()->init();
 
-	auto *mtl = MTL::CreateSystemDefaultDevice();
+	id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
 	if (!mtl)
 	{
 		fprintf(stderr, "No Metal device available.\n");
 		return EXIT_FAILURE;
 	}
-	printf("Device: %s\n", mtl->name()->utf8String());
+	printf("Device: %s\n", mtl.name.UTF8String);
 
-	if (!pyrowave_device_is_supported(mtl))
+	if (!pyrowave_device_is_supported((__bridge void *)mtl))
 	{
 		fprintf(stderr, "Metal device is not supported by PyroWave.\n");
 		return EXIT_FAILURE;
 	}
 
 	pyrowave_device_create_info device_info = {};
-	device_info.mtl_device = mtl;
+	device_info.mtl_device = (__bridge void *)mtl;
 	device_info.message_callback = message_cb;
 
 	pyrowave_device device = nullptr;
@@ -333,11 +330,11 @@ int main(int argc, char **argv)
 		}
 	}
 
-	auto *queue = mtl->newCommandQueue();
+	auto queue = [mtl newCommandQueue];
 
 	pyrowave_gpu_buffers buffers = {};
 	for (int i = 0; i < 3; i++)
-		buffers.planes[i] = planes[i].texture;
+		buffers.planes[i] = (__bridge void *)planes[i].texture;
 
 	// Feed one packet at a time so multi-frame streams decode frame by frame.
 	size_t offset = 0;
@@ -346,8 +343,8 @@ int main(int argc, char **argv)
 	bool failed = false;
 
 	auto decode_frame = [&]() -> bool {
-		auto *cmd = queue->commandBuffer();
-		auto decode_res = pyrowave_decoder_decode(decoder, cmd, &buffers);
+		auto cmd = [queue commandBuffer];
+		auto decode_res = pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers);
 		if (decode_res != PYROWAVE_SUCCESS)
 		{
 			fprintf(stderr, "Frame %d: decode failed: %s\n", frames,
@@ -355,13 +352,13 @@ int main(int argc, char **argv)
 			return false;
 		}
 
-		cmd->commit();
-		cmd->waitUntilCompleted();
+		[cmd commit];
+		[cmd waitUntilCompleted];
 
-		if (cmd->error())
+		if (cmd.error)
 		{
 			fprintf(stderr, "Frame %d: GPU error: %s\n", frames,
-			        cmd->error()->localizedDescription()->utf8String());
+			        cmd.error.localizedDescription.UTF8String);
 			return false;
 		}
 
@@ -507,13 +504,8 @@ int main(int argc, char **argv)
 			printf("%d of %d frame(s) differ from reference.\n", mismatched_frames, frames);
 	}
 
-	for (auto &plane : planes)
-		plane.texture->release();
-	queue->release();
 	pyrowave_decoder_destroy(decoder);
 	pyrowave_device_destroy(device);
-	mtl->release();
-	pool->release();
 
 	if (failed || frames == 0)
 		return EXIT_FAILURE;

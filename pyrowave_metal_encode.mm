@@ -11,9 +11,9 @@
 // The --input modes exist to cover all four ways a frame can reach the encoder:
 // planar or interleaved chroma, from host memory or from an IOSurface.
 
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 
-#include <IOSurface/IOSurfaceRef.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #include "pyrowave_metal.h"
 #include "pyrowave_bitstream.hpp"
@@ -388,19 +388,18 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	auto *pool = NS::AutoreleasePool::alloc()->init();
 
-	auto *mtl = MTL::CreateSystemDefaultDevice();
+	id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
 	if (!mtl)
 	{
 		fprintf(stderr, "No Metal device.\n");
 		return EXIT_FAILURE;
 	}
 
-	printf("Device: %s\n", mtl->name()->utf8String());
+	printf("Device: %s\n", mtl.name.UTF8String);
 
 	pyrowave_device_create_info device_info = {};
-	device_info.mtl_device = mtl;
+	device_info.mtl_device = (__bridge void *)mtl;
 	device_info.message_callback = message_cb;
 
 	pyrowave_device device = nullptr;
@@ -491,8 +490,6 @@ int main(int argc, char **argv)
 
 	pyrowave_encoder_destroy(encoder);
 	pyrowave_device_destroy(device);
-	mtl->release();
-	pool->release();
 
 	return frames > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -24,7 +24,7 @@
 // decoder emits: SDL_PIXELFORMAT_IYUV for 4:2:0 (half resolution chroma) and
 // SDL_PIXELFORMAT_P408 for 4:4:4 (full resolution chroma).
 
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 
 #include <SDL3/SDL.h>
 
@@ -290,9 +290,9 @@ int main(int argc, char **argv)
 	// decode and the render are the same device's resources and are ordered against
 	// each other by nothing more than command buffer submission order.
 	SDL_PropertiesID renderer_props = SDL_GetRendererProperties(renderer);
-	auto *mtl = static_cast<MTL::Device *>(
+	auto *mtl = (__bridge id<MTLDevice>)(
 			SDL_GetPointerProperty(renderer_props, SDL_PROP_RENDERER_METAL_DEVICE_POINTER, nullptr));
-	auto *queue = static_cast<MTL::CommandQueue *>(
+	auto *queue = (__bridge id<MTLCommandQueue>)(
 			SDL_GetPointerProperty(renderer_props, SDL_PROP_RENDERER_METAL_COMMAND_QUEUE_POINTER, nullptr));
 
 	if (!mtl || !queue)
@@ -301,7 +301,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (!pyrowave_device_is_supported(mtl))
+	if (!pyrowave_device_is_supported((__bridge void *)mtl))
 	{
 		fprintf(stderr, "No supported Metal device.\n");
 		return EXIT_FAILURE;
@@ -338,10 +338,10 @@ int main(int argc, char **argv)
 		SDL_PROP_TEXTURE_METAL_TEXTURE_V_POINTER,
 	};
 	SDL_PropertiesID texture_props = SDL_GetTextureProperties(texture);
-	MTL::Texture *planes[3] = {};
+	id<MTLTexture> planes[3] = {};
 	for (int i = 0; i < 3; i++)
 	{
-		planes[i] = static_cast<MTL::Texture *>(
+		planes[i] = (__bridge id<MTLTexture>)(
 				SDL_GetPointerProperty(texture_props, plane_props[i], nullptr));
 		if (!planes[i])
 		{
@@ -349,12 +349,12 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 		printf("  plane %d: %ux%u, usage %#x\n", i,
-		       unsigned(planes[i]->width()), unsigned(planes[i]->height()),
-		       unsigned(planes[i]->usage()));
+		       unsigned(planes[i].width), unsigned(planes[i].height),
+		       unsigned(planes[i].usage));
 	}
 
 	pyrowave_device_create_info device_info = {};
-	device_info.mtl_device = mtl;
+	device_info.mtl_device = (__bridge void *)mtl;
 	pyrowave_device device = nullptr;
 	auto res = pyrowave_device_create(&device_info, &device);
 	if (res != PYROWAVE_SUCCESS)
@@ -379,7 +379,7 @@ int main(int argc, char **argv)
 
 	pyrowave_gpu_buffers buffers = {};
 	for (int i = 0; i < 3; i++)
-		buffers.planes[i] = planes[i];
+		buffers.planes[i] = (__bridge void *)planes[i];
 
 	const uint64_t frame_time_ns = uint64_t(1e9 / (fps > 0.0 ? fps : 60.0));
 	size_t frame_index = 0;
@@ -407,7 +407,6 @@ int main(int argc, char **argv)
 
 		if (frame_index < info.frames.size())
 		{
-			auto *pool = NS::AutoreleasePool::alloc()->init();
 
 			auto range = info.frames[frame_index++];
 			pyrowave_decoder_clear(decoder);
@@ -420,8 +419,8 @@ int main(int argc, char **argv)
 			}
 			else
 			{
-				auto *cmd = queue->commandBuffer();
-				res = pyrowave_decoder_decode(decoder, cmd, &buffers);
+				auto cmd = [queue commandBuffer];
+				res = pyrowave_decoder_decode(decoder, (__bridge void *)cmd, &buffers);
 				if (res != PYROWAVE_SUCCESS)
 				{
 					fprintf(stderr, "decode failed: %s\n", pyrowave_result_to_string(res));
@@ -432,30 +431,29 @@ int main(int argc, char **argv)
 					// This command buffer came from the renderer's own queue, so
 					// committing it here orders it ahead of everything SDL submits
 					// for this frame. No CPU wait, and no event or fence either.
-					cmd->commit();
+					[cmd commit];
 					have_frame = true;
 
 					if (sync_decode)
-						cmd->waitUntilCompleted();
+						[cmd waitUntilCompleted];
 
 					if (report_timing)
 					{
 						// Only a benchmark blocks; this is not part of the normal path.
-						cmd->waitUntilCompleted();
-						decode_ms.push_back((cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0);
+						[cmd waitUntilCompleted];
+						decode_ms.push_back((cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0);
 						if (decode_ms.size() >= 400)
 							running = false;
-						if (cmd->error())
+						if (cmd.error)
 						{
 							fprintf(stderr, "GPU error: %s\n",
-							        cmd->error()->localizedDescription()->utf8String());
+							        cmd.error.localizedDescription.UTF8String);
 							running = false;
 						}
 					}
 				}
 			}
 
-			pool->release();
 
 			if (frame_index >= info.frames.size() && loop)
 				frame_index = 0;

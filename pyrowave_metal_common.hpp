@@ -6,10 +6,12 @@
 // pyrowave_device, the library/pipeline helpers, and the wavelet coefficient
 // pyramid, which both directions allocate identically.
 //
-// This is not a public header. pyrowave_metal_common.cpp is the single
-// translation unit that instantiates metal-cpp.
+// This is not a public header, and it is Objective-C++: the backends are .mm so they
+// can use Metal directly while keeping the C++ bitstream layer. Everything here is
+// under ARC, so the id<MTL...> members below are strong references and nothing needs
+// explicit retain or release.
 
-#include <Metal/Metal.hpp>
+#import <Metal/Metal.h>
 
 #include "pyrowave_metal.h"
 #include "pyrowave_bitstream.hpp"
@@ -50,25 +52,26 @@ constexpr uint32_t ResolveThreadgroupSize = 32;
 constexpr int DefaultPrecision = 1;
 
 int requested_precision();
-MTL::PixelFormat wavelet_format(int precision);
+MTLPixelFormat wavelet_format(int precision);
 
 const char *result_string(pyrowave_result result);
 
-MTL::Library *compile_library(pyrowave_device device, const char *source, const char *label);
+id<MTLLibrary> compile_library(pyrowave_device device, const char *source, const char *label);
 
-// `constants` may be NULL when the shader has no specialization constants to set.
-MTL::ComputePipelineState *create_pipeline(pyrowave_device device, MTL::Library *library,
-                                          const char *entry_point, uint32_t required_threads,
-                                          MTL::FunctionConstantValues *constants = nullptr);
+// `constants` may be nil when the shader has no specialization constants to set.
+id<MTLComputePipelineState> create_pipeline(pyrowave_device device, id<MTLLibrary> library,
+                                           const char *entry_point, uint32_t required_threads,
+                                           MTLFunctionConstantValues *constants = nil);
 
 // Convenience for a single bool function constant. Note Metal refuses to build a
 // pipeline from an unspecialized function if the shader declares any function
 // constants at all, even ones SPIRV-Cross guarded with
 // is_function_constant_defined(), so constants that want their default value
 // still have to be set explicitly.
-MTL::ComputePipelineState *create_pipeline_bool_constant(pyrowave_device device, MTL::Library *library,
-                                                        const char *entry_point, uint32_t required_threads,
-                                                        uint32_t index, bool value);
+id<MTLComputePipelineState> create_pipeline_bool_constant(pyrowave_device device, id<MTLLibrary> library,
+                                                          const char *entry_point,
+                                                          uint32_t required_threads,
+                                                          uint32_t index, bool value);
 
 // The wavelet coefficient pyramid. The decoder fills it from the bitstream and
 // runs the iDWT out of it; the encoder runs the DWT into it and quantizes out of
@@ -77,15 +80,14 @@ MTL::ComputePipelineState *create_pipeline_bool_constant(pyrowave_device device,
 struct WaveletPyramid
 {
 	// 2D array, NumFrequencyBandsPerLevel * NumComponents layers, DecompositionLevels mips.
-	MTL::Texture *texture = nullptr;
+	id<MTLTexture> texture;
 	// 4 layer array views, one per component and level. Written as an image and
 	// sampled as an array.
-	MTL::Texture *component_layer_views[NumComponents][DecompositionLevels] = {};
+	id<MTLTexture> component_layer_views[NumComponents][DecompositionLevels];
 	// Single layer 2D views of band 0 (LL).
-	MTL::Texture *component_ll_views[NumComponents][DecompositionLevels] = {};
+	id<MTLTexture> component_ll_views[NumComponents][DecompositionLevels];
 
 	bool init(pyrowave_device device, const BlockLayout &layout);
-	~WaveletPyramid();
 
 	WaveletPyramid() = default;
 	WaveletPyramid(const WaveletPyramid &) = delete;
@@ -95,34 +97,32 @@ struct WaveletPyramid
 
 struct pyrowave_device_opaque
 {
-	MTL::Device *mtl = nullptr;
+	id<MTLDevice> mtl;
 
 	// Decode. Compiled by pyrowave_device_create().
-	MTL::ComputePipelineState *dequant_pipeline = nullptr;
+	id<MTLComputePipelineState> dequant_pipeline;
 	// Indexed by the DCShift function constant.
-	MTL::ComputePipelineState *idwt_pipeline[2] = {};
+	id<MTLComputePipelineState> idwt_pipeline[2];
 
 	// Encode. Compiled on demand by the first pyrowave_encoder_create(), so that
 	// decode-only users do not pay for six extra shader compiles.
-	MTL::ComputePipelineState *dwt_pipeline[2] = {};
-	MTL::ComputePipelineState *quant_pipeline = nullptr;
-	MTL::ComputePipelineState *analyze_pipeline = nullptr;
-	MTL::ComputePipelineState *analyze_finalize_pipeline = nullptr;
-	MTL::ComputePipelineState *resolve_pipeline = nullptr;
-	MTL::ComputePipelineState *block_packing_pipeline = nullptr;
+	id<MTLComputePipelineState> dwt_pipeline[2];
+	id<MTLComputePipelineState> quant_pipeline;
+	id<MTLComputePipelineState> analyze_pipeline;
+	id<MTLComputePipelineState> analyze_finalize_pipeline;
+	id<MTLComputePipelineState> resolve_pipeline;
+	id<MTLComputePipelineState> block_packing_pipeline;
 	bool encode_pipelines_ready = false;
 	std::mutex encode_pipeline_lock;
 
-	MTL::SamplerState *mirror_repeat_sampler = nullptr;
+	id<MTLSamplerState> mirror_repeat_sampler;
 	// Clamp to transparent black. Only the encoder's quantizer wants this, so it
 	// is created together with the encode pipelines.
-	MTL::SamplerState *border_sampler = nullptr;
+	id<MTLSamplerState> border_sampler;
 
 	pyrowave_message_cb message_cb = nullptr;
 	void *message_userdata = nullptr;
 	int precision = PyroWave::DefaultPrecision;
 
 	void log(const char *fmt, ...) const __attribute__((format(printf, 2, 3)));
-
-	~pyrowave_device_opaque();
 };
