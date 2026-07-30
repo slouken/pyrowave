@@ -213,7 +213,14 @@ PYROWAVE_PUBLIC_API pyrowave_result
 pyrowave_encoder_compute_num_packets(pyrowave_encoder encoder, size_t packet_boundary,
                                      size_t *num_packets);
 
-// `packets` must have room for at least the count reported above.
+// `packets` must have room for at least the count reported above; the number
+// actually written is at most that and is returned in out_packets.
+//
+// Note packet_boundary is not a hard cap. A coded 32x32 block is the smallest unit
+// a packet can carry, so a block that is on its own larger than packet_boundary
+// yields one oversized packet rather than being split. Raising the rate control
+// target makes individual blocks larger, so a caller sizing packets to an MTU
+// should check the sizes it gets back rather than assume they fit.
 PYROWAVE_PUBLIC_API pyrowave_result
 pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_packet *packets,
                            size_t packet_boundary, size_t *out_packets,

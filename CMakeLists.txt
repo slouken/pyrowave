@@ -221,7 +221,9 @@ if (PYROWAVE_METAL)
     # committed, so building does not require glslang or spirv-cross.
     add_library(pyrowave-metal STATIC
             pyrowave_metal.h
+            pyrowave_metal_common.cpp pyrowave_metal_common.hpp
             pyrowave_decoder_metal.cpp
+            pyrowave_encoder_metal.cpp
             pyrowave_bitstream.cpp pyrowave_bitstream.hpp
             shaders/metal/pyrowave_msl.h)
 
@@ -237,7 +239,10 @@ if (PYROWAVE_METAL)
     target_compile_features(pyrowave-metal PUBLIC cxx_std_17)
     set_target_properties(pyrowave-metal PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(pyrowave-metal PUBLIC
-            "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+            # IOSurface is for the encoder's GPU input path, which wraps the
+            # caller's surfaces itself.
+            "-framework Metal" "-framework Foundation" "-framework QuartzCore"
+            "-framework IOSurface" "-framework CoreFoundation")
 
     if (${PROJECT_IS_TOP_LEVEL})
         # yuv4mpeg is otherwise only built for the Granite sandbox, which is
@@ -252,6 +257,11 @@ if (PYROWAVE_METAL)
         target_link_libraries(pyrowave-metal-decode PRIVATE pyrowave-metal pyrowave-utils)
         target_include_directories(pyrowave-metal-decode SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
         target_compile_options(pyrowave-metal-decode PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
+
+        add_executable(pyrowave-metal-encode pyrowave_metal_encode.cpp)
+        target_link_libraries(pyrowave-metal-encode PRIVATE pyrowave-metal pyrowave-utils)
+        target_include_directories(pyrowave-metal-encode SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
+        target_compile_options(pyrowave-metal-encode PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
 
         add_executable(pyrowave-metal-test pyrowave_metal_test.cpp)
         target_link_libraries(pyrowave-metal-test PRIVATE pyrowave-metal)

@@ -6,8 +6,10 @@
 // and packet parsing. Contains no graphics API dependency, so it can back either
 // the Vulkan decoder or the Metal one.
 
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <vector>
 #include "pyrowave_config.hpp"
 
@@ -74,6 +76,30 @@ static constexpr int NumFrequencyBandsPerLevel = 4;
 static inline int align(int value, int alignment)
 {
 	return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// The 8 bit quantization code carried in BitstreamHeader::quant_code. A custom
+// float formulation for numbers in the (0, 2) range; both directions are part of
+// the bitstream definition, so they live here rather than in either backend.
+static constexpr int MaxScaleExp = 4;
+
+static inline float decode_quant(uint8_t quant_code)
+{
+	int e = MaxScaleExp - (quant_code >> 3);
+	int m = quant_code & 0x7;
+	return (1.0f / (8.0f * 1024.0f * 1024.0f)) * float((8 + m) * (1 << (20 + e)));
+}
+
+static inline uint8_t encode_quant(float decoder_q_scale)
+{
+	uint32_t v;
+	memcpy(&v, &decoder_q_scale, sizeof(decoder_q_scale));
+
+	int e = ((v >> 23) & 0xff) - 127 - MaxScaleExp;
+	int m = (v >> 20) & 0x7;
+	e = -e;
+	assert(e >= 0 && e <= 20);
+	return uint8_t((e << 3) | m);
 }
 
 // Pure integer derivation of where every 8x8 and 32x32 block lives in the wavelet
