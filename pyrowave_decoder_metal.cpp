@@ -8,7 +8,6 @@
 
 #include "pyrowave_metal_common.hpp"
 
-#include <atomic>
 #include <memory>
 #include <string.h>
 #include <vector>
@@ -37,17 +36,36 @@ struct IdwtPush
 };
 static_assert(sizeof(IdwtPush) == 16, "IdwtPush layout mismatch.");
 
-// A pair of upload buffers. The GPU may still be reading a previous frame's
-// buffers, so decode cycles through slots and only reuses one once its command
-// buffer has completed.
+// How many frames' worth of upload buffers exist. Decode rotates through them, so
+// this is how many decodes a caller may have in flight before acquiring a slot has
+// to wait for the oldest to finish. Two would suffice for the intended display loop;
+// four leaves headroom without the memory mattering (~1 MB per slot at 4K).
+constexpr size_t UploadSlotCount = 4;
+
+// A pair of upload buffers. The GPU may still be reading a previous frame's buffers,
+// so a slot is only rewritten once the command buffer that consumed it has completed.
 struct UploadSlot
 {
 	MTL::Buffer *offsets = nullptr;
 	MTL::Buffer *payload = nullptr;
-	std::atomic<bool> in_flight{false};
+	// The command buffer that last read this slot, retained so that reuse can wait on
+	// it. Null once it has completed and been reclaimed.
+	MTL::CommandBuffer *consumer = nullptr;
+
+	void reclaim()
+	{
+		if (!consumer)
+			return;
+		// Returns immediately unless the caller really is UploadSlotCount decodes
+		// ahead of the GPU.
+		consumer->waitUntilCompleted();
+		consumer->release();
+		consumer = nullptr;
+	}
 
 	~UploadSlot()
 	{
+		reclaim();
 		if (offsets)
 			offsets->release();
 		if (payload)
@@ -64,7 +82,12 @@ struct pyrowave_decoder_opaque
 	BitstreamParser parser;
 	WaveletPyramid wavelet;
 
-	std::vector<std::unique_ptr<UploadSlot>> upload_slots;
+	// Fixed size on purpose. This used to be a vector that appended a slot whenever
+	// none was free, which grows without bound if a caller submits decodes faster
+	// than they complete -- unboundedly in memory, and the linear scan for a free
+	// slot got slower with it.
+	UploadSlot upload_slots[UploadSlotCount];
+	size_t next_upload_slot = 0;
 };
 
 namespace
@@ -95,22 +118,11 @@ bool ensure_buffer(pyrowave_device device, MTL::Buffer **buffer, size_t size)
 
 UploadSlot *acquire_upload_slot(pyrowave_decoder decoder, size_t offsets_size, size_t payload_size)
 {
-	UploadSlot *slot = nullptr;
+	UploadSlot *slot = &decoder->upload_slots[decoder->next_upload_slot];
+	decoder->next_upload_slot = (decoder->next_upload_slot + 1) % UploadSlotCount;
 
-	for (auto &candidate : decoder->upload_slots)
-	{
-		if (!candidate->in_flight.load(std::memory_order_acquire))
-		{
-			slot = candidate.get();
-			break;
-		}
-	}
-
-	if (!slot)
-	{
-		decoder->upload_slots.emplace_back(new UploadSlot);
-		slot = decoder->upload_slots.back().get();
-	}
+	// Applies back pressure rather than allocating another slot.
+	slot->reclaim();
 
 	if (!ensure_buffer(decoder->device, &slot->offsets, offsets_size) ||
 	    !ensure_buffer(decoder->device, &slot->payload, payload_size))
@@ -393,10 +405,9 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_idwt(decoder, idwt_enc, planes);
 	idwt_enc->endEncoding();
 
-	slot->in_flight.store(true, std::memory_order_release);
-	cmd->addCompletedHandler([slot](MTL::CommandBuffer *) {
-		slot->in_flight.store(false, std::memory_order_release);
-	});
+	// Retained until this slot comes round again, so its buffers cannot be rewritten
+	// while the GPU is still reading them.
+	slot->consumer = cmd->retain();
 
 	decoder->parser.mark_frame_decoded();
 	return PYROWAVE_SUCCESS;
