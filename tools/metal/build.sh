@@ -20,10 +20,20 @@ fi
 
 CXX="xcrun -sdk macosx clang++ -std=c++17 -O2 -fblocks -I. -Imetal-cpp"
 FRAMEWORKS="-framework Metal -framework Foundation"
-DECODER="pyrowave_decoder_metal.cpp pyrowave_bitstream.cpp"
+# pyrowave_metal_common.cpp is the translation unit that instantiates metal-cpp and
+# defines the shared device object, so every tool that pulls in a backend needs it.
+COMMON="pyrowave_metal_common.cpp pyrowave_bitstream.cpp"
+DECODER="pyrowave_decoder_metal.cpp $COMMON"
+ENCODER="pyrowave_encoder_metal.cpp $COMMON"
 
 echo "bench"
 $CXX $FRAMEWORKS tools/metal/bench.cpp $DECODER -o $OUT/bench
+
+# The encoder's timing hooks are #ifdef'd out of ordinary builds, so ask for them.
+echo "bench_encode"
+$CXX $FRAMEWORKS -framework IOSurface -framework CoreFoundation \
+	-DPYROWAVE_METAL_BENCH_HOOKS \
+	tools/metal/bench_encode.cpp $ENCODER -o $OUT/bench_encode
 
 echo "dispatch_cost"
 $CXX $FRAMEWORKS tools/metal/dispatch_cost.cpp -o $OUT/dispatch_cost

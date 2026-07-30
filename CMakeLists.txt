@@ -263,19 +263,6 @@ if (PYROWAVE_METAL)
         target_include_directories(pyrowave-metal-encode SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
         target_compile_options(pyrowave-metal-encode PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
 
-        # Encoder benchmark. The timing hooks it needs sit inside the backend, since
-        # the encoder owns its command buffer and never hands it out, so they are
-        # opt-in and #ifdef'd out of every ordinary build.
-        option(PYROWAVE_METAL_BENCH_HOOKS
-                "Compile the Metal encoder's benchmark timing hooks and build the benchmark." OFF)
-        if (PYROWAVE_METAL_BENCH_HOOKS)
-            target_compile_definitions(pyrowave-metal PUBLIC PYROWAVE_METAL_BENCH_HOOKS)
-            add_executable(pyrowave-metal-bench-encode tools/metal/bench_encode.cpp)
-            target_link_libraries(pyrowave-metal-bench-encode PRIVATE pyrowave-metal)
-            target_include_directories(pyrowave-metal-bench-encode SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
-            target_compile_options(pyrowave-metal-bench-encode PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
-        endif()
-
         add_executable(pyrowave-metal-test pyrowave_metal_test.cpp)
         target_link_libraries(pyrowave-metal-test PRIVATE pyrowave-metal)
         target_include_directories(pyrowave-metal-test SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})

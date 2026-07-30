@@ -1,15 +1,20 @@
-# Metal decoder experiment tools
+# Metal port experiment tools
 
-Throwaway-quality tools written while porting the decoder to Metal and tuning it.
-They are kept on this branch rather than `metal-decoder-backend` because they are
-investigation aids, not part of the library: no CMake wiring, minimal error
-handling, hardcoded assumptions. They are here because re-deriving the
-measurements is much more work than re-reading the code.
+Tools written while porting the decoder and encoder to Metal and tuning them. They
+are investigation aids, not part of the library: no CMake wiring, minimal error
+handling, hardcoded assumptions. They are here because re-deriving the measurements
+is much more work than re-reading the code.
 
 Build everything with `./tools/metal/build.sh`, which drops binaries in
-`build-tools/`. Some tools need `samples/` (see the top of this file's "Sample
-data" section) and `sdl_plane_test` needs an SDL with the per plane IOSurface
-texture properties.
+`build-tools/`. Some tools need `samples/` (see the "Sample data" section at the
+bottom) and `sdl_plane_test` needs an SDL with the per plane IOSurface texture
+properties.
+
+`bench_encode` is the one tool that needs something from the library itself: the
+encoder owns its command buffer and never hands it out, so reading `GPUStartTime`
+or swapping the dispatch type has to happen inside the backend. Those two hooks sit
+behind `PYROWAVE_METAL_BENCH_HOOKS` in `pyrowave_encoder_metal.cpp` and are
+compiled out of every ordinary build; `build.sh` passes the define.
 
 ## Performance tools
 
@@ -24,6 +29,44 @@ Decodes the first frame of a stream repeatedly and reports GPU time from
 work; single medians vary enough to invent a 1.4x speedup that is not real. Every
 performance claim in the commit messages comes from min-of-400 over three
 interleaved rounds.
+
+### `bench_encode.cpp` — encoder GPU timing, and the dispatch mode A/B
+Encodes a synthetic frame at six configurations and reports GPU time, the wall
+clock latency an application actually sees from the synchronous encode API, and the
+CPU cost of `packetize`. It also measures the concurrent compute encoder against a
+serial one, interleaving both modes inside a single run.
+
+    build-tools/bench_encode [iterations]
+
+Apple M1, min of 400 interleaved iterations, rate target `width*height/8`:
+
+    case                gpu min  wall min  packetize
+    640x480 420           0.392     0.774      0.006
+    1280x720 420          0.730     1.035      0.018
+    1920x1080 420         1.334     1.653      0.038
+    1920x1080 444         2.270     2.588      0.045
+    3840x2160 420         4.730     5.103      0.150
+
+1080p 4:2:0 encodes in ~1.33 ms of GPU time, about **2.2x the decoder's 0.627 ms**,
+which is what five stages against two ought to cost. `packetize` is a CPU memcpy and
+never matters. The gap between gpu and wall is command buffer submission and
+completion notification, which the synchronous API cannot avoid.
+
+Serial against concurrent, GPU minimum: **2.47x at 640x480**, 1.81x at 720p, 1.44x
+at 1080p 4:2:0, 1.29x at 1080p 4:4:4, 1.14x at 4K. Same shape as the decoder, and
+the same cause — see `dispatch_cost.cpp` below.
+
+**Interleave the A/B inside one run.** Measuring the two dispatch modes in separate
+runs inflated the 480p speedup from 2.47x to 2.70x, purely from background load
+drifting between runs. The serial toggle is re-read per encode specifically so this
+is possible.
+
+**Unexpected: the IOSurface input path costs ~12% more GPU time than feeding from
+host memory** (1.334 vs 1.184 ms at 1080p 4:2:0, consistently). Most likely because
+IOSurface backed textures are forced linear while Metal allocated ones can be tiled,
+which the DWT's gather reads care about. IOSurface still wins overall on wall clock,
+1.653 against 2.407 ms, because the host path pays a 3 MB upload first — but
+zero-copy is not free here.
 
 ### `dispatch_cost.cpp` — marginal cost of a compute dispatch
 Sweeps dispatch count with a trivial kernel, serial vs concurrent encoder. The

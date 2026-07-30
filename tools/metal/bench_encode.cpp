@@ -3,12 +3,12 @@
 
 // Benchmark for the Metal encoder.
 //
-// Build it with the backend's timing hooks enabled, since they are compiled out of
+// Built by ./tools/metal/build.sh like the rest of these tools, which passes
+// -DPYROWAVE_METAL_BENCH_HOOKS because the backend compiles the timing hooks out of
 // ordinary builds:
 //
-//   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPYROWAVE_METAL_BENCH_HOOKS=ON
-//   ninja -C build pyrowave-metal-bench-encode
-//   ./build/pyrowave-metal-bench-encode [iterations]
+//   ./tools/metal/build.sh
+//   build-tools/bench_encode [iterations]
 //
 // Reports three things per resolution: GPU execution time, the wall clock latency
 // an application actually sees from the "synchronous" encode API, and the CPU cost
