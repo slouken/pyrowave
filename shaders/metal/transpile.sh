@@ -20,11 +20,20 @@ trap 'rm -rf "$TMP"' EXIT
 # explicitly or the #includes in the shaders are rejected.
 PREAMBLE='#extension GL_GOOGLE_include_directive : require'
 
-# PRECISION=2 is FP32, which is what the Metal decoder runs for now.
+# PRECISION=2 is FP32; PRECISION=0 with FP16 is the half precision path, which
+# uses an R16F wavelet pyramid and halves the iDWT's threadgroup array.
 # STORAGE_MODE=0 is the plain SSBO path with 8/16-bit storage.
 glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
 	-DPRECISION=2 -DFP16=0 -Ishaders \
 	-o "$TMP/idwt.spv" shaders/idwt.comp
+
+glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
+	-DPRECISION=1 -DFP16=1 -Ishaders \
+	-o "$TMP/idwt_fp16_storage.spv" shaders/idwt.comp
+
+glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
+	-DPRECISION=0 -DFP16=1 -Ishaders \
+	-o "$TMP/idwt_fp16.spv" shaders/idwt.comp
 
 glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
 	-DSTORAGE_MODE=0 -Ishaders \
@@ -37,6 +46,14 @@ glslangValidator --target-env vulkan1.3 -P"$PREAMBLE" \
 spirv-cross --msl --msl-version 30000 \
 	--rename-entry-point main pyrowave_idwt comp \
 	"$TMP/idwt.spv" --output "$OUT/idwt.metal"
+
+spirv-cross --msl --msl-version 30000 \
+	--rename-entry-point main pyrowave_idwt comp \
+	"$TMP/idwt_fp16_storage.spv" --output "$OUT/idwt_fp16_storage.metal"
+
+spirv-cross --msl --msl-version 30000 \
+	--rename-entry-point main pyrowave_idwt comp \
+	"$TMP/idwt_fp16.spv" --output "$OUT/idwt_fp16.metal"
 
 spirv-cross --msl --msl-version 30000 \
 	--rename-entry-point main pyrowave_wavelet_dequant comp \
@@ -56,10 +73,18 @@ EMBED=$OUT/pyrowave_msl.h
 	cat "$OUT/idwt.metal"
 	echo ")PYROWAVE_MSL\";"
 	echo
+	echo "static const char idwt_fp16_storage_msl_source[] = R\"PYROWAVE_MSL("
+	cat "$OUT/idwt_fp16_storage.metal"
+	echo ")PYROWAVE_MSL\";"
+	echo
+	echo "static const char idwt_fp16_msl_source[] = R\"PYROWAVE_MSL("
+	cat "$OUT/idwt_fp16.metal"
+	echo ")PYROWAVE_MSL\";"
+	echo
 	echo "static const char wavelet_dequant_msl_source[] = R\"PYROWAVE_MSL("
 	cat "$OUT/wavelet_dequant.metal"
 	echo ")PYROWAVE_MSL\";"
 	echo "}"
 } > "$EMBED"
 
-echo "Wrote $OUT/idwt.metal, $OUT/wavelet_dequant.metal and $EMBED"
+echo "Wrote $OUT/idwt.metal, $OUT/idwt_fp16.metal, $OUT/wavelet_dequant.metal and $EMBED"

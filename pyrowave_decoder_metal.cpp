@@ -49,7 +49,46 @@ static_assert(sizeof(IdwtPush) == 16, "IdwtPush layout mismatch.");
 constexpr uint32_t DequantThreadgroupSize = 128;
 constexpr uint32_t IdwtThreadgroupSize = 64;
 
-constexpr MTL::PixelFormat WaveletFormat = MTL::PixelFormatR32Float;
+// Same meaning and same env var as the Vulkan build:
+//   2  FP32 storage and math
+//   1  (default) FP16 storage, FP32 lifting math, half sized threadgroup array
+//   0  FP16 throughout
+//
+// 1 is the default because it is both the fastest and essentially free: on an
+// M1 it decodes 1080p roughly 1.4x quicker than FP32 while staying within 1 LSB
+// of the Vulkan decoder. The win is the halved memory traffic through the R16F
+// wavelet pyramid, which is what the decode is bound by above 480p -- 0 is
+// actually slower than 1 despite the half precision arithmetic, and costs
+// accuracy, so it is not recommended.
+//
+// Note 1 is not quite identical to the Vulkan build's: that one additionally
+// splits the low frequency bands into a separate FP32 image, which is not
+// implemented here.
+constexpr int DefaultPrecision = 1;
+
+int requested_precision()
+{
+	const char *env = getenv("PYROWAVE_PRECISION");
+	if (!env)
+		return DefaultPrecision;
+	int precision = atoi(env);
+	return (precision < 0 || precision > 2) ? DefaultPrecision : precision;
+}
+
+MTL::PixelFormat wavelet_format(int precision)
+{
+	return precision == 2 ? MTL::PixelFormatR32Float : MTL::PixelFormatR16Float;
+}
+
+const char *idwt_source_for(int precision)
+{
+	switch (precision)
+	{
+	case 0: return idwt_fp16_msl_source;
+	case 1: return idwt_fp16_storage_msl_source;
+	default: return idwt_msl_source;
+	}
+}
 
 // A pair of upload buffers. The GPU may still be reading a previous frame's
 // buffers, so decode cycles through slots and only reuses one once its command
@@ -96,6 +135,7 @@ struct pyrowave_device_opaque
 
 	pyrowave_message_cb message_cb = nullptr;
 	void *message_userdata = nullptr;
+	int precision = DefaultPrecision;
 
 	void log(const char *fmt, ...) const __attribute__((format(printf, 2, 3)));
 
@@ -251,7 +291,7 @@ bool create_wavelet_resources(pyrowave_decoder decoder)
 
 	auto *desc = MTL::TextureDescriptor::alloc()->init();
 	desc->setTextureType(MTL::TextureType2DArray);
-	desc->setPixelFormat(WaveletFormat);
+	desc->setPixelFormat(wavelet_format(decoder->device->precision));
 	desc->setWidth(layout.aligned_width / 2);
 	desc->setHeight(layout.aligned_height / 2);
 	desc->setArrayLength(NumFrequencyBandsPerLevel * NumComponents);
@@ -278,13 +318,13 @@ bool create_wavelet_resources(pyrowave_decoder decoder)
 		{
 			decoder->component_layer_views[component][level] =
 					decoder->wavelet->newTextureView(
-							WaveletFormat, MTL::TextureType2DArray,
+							wavelet_format(decoder->device->precision), MTL::TextureType2DArray,
 							NS::Range(level, 1),
 							NS::Range(NumFrequencyBandsPerLevel * component, NumFrequencyBandsPerLevel));
 
 			decoder->component_ll_views[component][level] =
 					decoder->wavelet->newTextureView(
-							WaveletFormat, MTL::TextureType2D,
+							wavelet_format(decoder->device->precision), MTL::TextureType2D,
 							NS::Range(level, 1),
 							NS::Range(NumFrequencyBandsPerLevel * component, 1));
 
@@ -522,7 +562,11 @@ pyrowave_result pyrowave_device_create(const pyrowave_device_create_info *info, 
 	created->mtl = mtl->retain();
 
 	auto *dequant_library = compile_library(created.get(), wavelet_dequant_msl_source, "wavelet_dequant");
-	auto *idwt_library = compile_library(created.get(), idwt_msl_source, "idwt");
+	created->precision = requested_precision();
+	char idwt_label[32];
+	snprintf(idwt_label, sizeof(idwt_label), "idwt (precision %d)", created->precision);
+	auto *idwt_library = compile_library(created.get(),
+	                                     idwt_source_for(created->precision), idwt_label);
 	if (!dequant_library || !idwt_library)
 	{
 		if (dequant_library)

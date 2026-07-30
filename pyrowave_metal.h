@@ -106,6 +106,12 @@ typedef struct pyrowave_device_create_info
 
 // Creates the shared device object. This compiles the decode pipelines, so it is
 // comparatively expensive; create one and share it across decoders.
+//
+// The PYROWAVE_PRECISION environment variable selects the wavelet precision, as
+// on the Vulkan side: 2 is FP32, 1 (the default) keeps FP32 lifting math but
+// stores the wavelet pyramid as FP16, and 0 is FP16 throughout. 1 is both the
+// fastest and within 1 LSB of the FP32 result; 0 is slower than 1 and less
+// accurate, so it exists mainly for comparison.
 PYROWAVE_PUBLIC_API pyrowave_result
 pyrowave_device_create(const pyrowave_device_create_info *info, pyrowave_device *device);
 
