@@ -14,9 +14,9 @@
 // allow an IOSurface backed texture to be an array texture, which is how SDL
 // otherwise stores the two chroma planes.
 //
-// 4:4:4 only for now: SDL_PIXELFORMAT_P408 is the 3 plane format that matches
-// what the decoder emits. 4:2:0 output would need either an NV12 style
-// interleave or a 3 plane 4:2:0 path.
+// Both chroma modes map onto a 3 plane SDL format, which is exactly what the
+// decoder emits: SDL_PIXELFORMAT_IYUV for 4:2:0 (half resolution chroma) and
+// SDL_PIXELFORMAT_P408 for 4:4:4 (full resolution chroma).
 
 #include <Metal/Metal.hpp>
 
@@ -260,16 +260,13 @@ int main(int argc, char **argv)
 	if (!load_stream(stream_path, info))
 		return EXIT_FAILURE;
 
-	if (info.chroma != PYROWAVE_CHROMA_SUBSAMPLING_444)
-	{
-		fprintf(stderr, "This viewer currently handles 4:4:4 streams only; %s is 4:2:0.\n",
-		        stream_path);
-		return EXIT_FAILURE;
-	}
+	const bool is_420 = info.chroma == PYROWAVE_CHROMA_SUBSAMPLING_420;
+	// Both are 3 plane formats; they differ only in chroma resolution.
+	const SDL_PixelFormat sdl_format = is_420 ? SDL_PIXELFORMAT_IYUV : SDL_PIXELFORMAT_P408;
 
 	double fps = fps_override > 0.0 ? fps_override : double(info.fps_num) / double(info.fps_den);
-	printf("%dx%d 444, %zu frame(s), %.2f fps, %s range, %s\n",
-	       info.width, info.height, info.frames.size(), fps,
+	printf("%dx%d %s, %zu frame(s), %.2f fps, %s range, %s\n",
+	       info.width, info.height, is_420 ? "420" : "444", info.frames.size(), fps,
 	       info.full_range ? "full" : "limited", info.bt2020 ? "BT.2020" : "BT.709");
 
 	if (!SDL_Init(SDL_INIT_VIDEO))
@@ -306,17 +303,23 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	const int chroma_width = is_420 ? info.width / 2 : info.width;
+	const int chroma_height = is_420 ? info.height / 2 : info.height;
+
 	IOSurfaceRef surfaces[3] = {};
 	MTL::Texture *planes[3] = {};
 	for (int i = 0; i < 3; i++)
 	{
-		surfaces[i] = create_plane_surface(info.width, info.height);
+		const int w = i == 0 ? info.width : chroma_width;
+		const int h = i == 0 ? info.height : chroma_height;
+
+		surfaces[i] = create_plane_surface(w, h);
 		if (!surfaces[i])
 		{
 			fprintf(stderr, "IOSurfaceCreate failed for plane %d.\n", i);
 			return EXIT_FAILURE;
 		}
-		planes[i] = create_plane_texture(mtl, surfaces[i], info.width, info.height);
+		planes[i] = create_plane_texture(mtl, surfaces[i], w, h);
 		if (!planes[i])
 		{
 			fprintf(stderr, "Failed to wrap plane %d in a Metal texture.\n", i);
@@ -331,14 +334,15 @@ int main(int argc, char **argv)
 		colorspace = info.full_range ? SDL_COLORSPACE_BT709_FULL : SDL_COLORSPACE_BT709_LIMITED;
 
 	SDL_PropertiesID props = SDL_CreateProperties();
-	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_P408);
+	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, sdl_format);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, info.width);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, info.height);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, colorspace);
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_PLANE0_POINTER, surfaces[0]);
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_PLANE1_POINTER, surfaces[1]);
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_PLANE2_POINTER, surfaces[2]);
+	// Named by component, so the decoder's Cb and Cr map straight across.
+	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_POINTER, surfaces[0]);
+	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_U_POINTER, surfaces[1]);
+	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_V_POINTER, surfaces[2]);
 	SDL_Texture *texture = SDL_CreateTextureWithProperties(renderer, props);
 	SDL_DestroyProperties(props);
 
