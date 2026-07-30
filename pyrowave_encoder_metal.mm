@@ -198,18 +198,28 @@ uint32_t floor_log2(uint32_t v)
 struct InputTextures
 {
 	id<MTLTexture> sampled[NumComponents] = {};
-	id<MTLTexture> owned[4] = {};
+	// Worst case is NV12: the luma plane, the interleaved chroma plane and its two
+	// swizzled views. The three plane paths only ever use three.
+	static constexpr int MaxOwned = 4;
+	id<MTLTexture> owned[MaxOwned] = {};
 	int num_owned = 0;
 
 	id<MTLTexture> adopt(id<MTLTexture> texture)
 	{
 		if (texture)
+		{
+			assert(num_owned < MaxOwned);
 			owned[num_owned++] = texture;
+		}
 		return texture;
 	}
 
 	void release_all()
 	{
+		// sampled[] aliases owned[] for NV12, but each is an independent strong
+		// reference under ARC, so both arrays have to be cleared.
+		for (int i = 0; i < num_owned; i++)
+			owned[i] = nil;
 		num_owned = 0;
 		for (int i = 0; i < NumComponents; i++)
 			sampled[i] = nil;
