@@ -449,6 +449,12 @@ void encode_idwt(pyrowave_decoder decoder, MTL::ComputeCommandEncoder *enc,
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
+		// Levels are a dependent chain: this one reads the LL band the previous
+		// one produced. Within a level the three components are independent, so
+		// the encoder runs concurrently and only the level boundaries barrier.
+		if (input_level != DecompositionLevels - 1)
+			enc->memoryBarrier(MTL::BarrierScopeTextures);
+
 		IdwtPush push = {};
 		// The shader transposes on load, so resolution is swapped here.
 		push.resolution[0] = layout.level_height(input_level);
@@ -752,10 +758,11 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_dequant(decoder, dequant_enc, slot);
 	dequant_enc->endEncoding();
 
-	// The iDWT stays serial: each level consumes the previous level's output.
-	// Ordering against the dequant work above comes from the encoder boundary,
-	// which Metal tracks automatically.
-	auto *idwt_enc = cmd->computeCommandEncoder();
+	// The iDWT is a dependent chain across levels, but the three components within
+	// a level are independent, so this is also concurrent with explicit barriers
+	// at the level boundaries only. Ordering against the dequant work above comes
+	// from the encoder boundary, which Metal tracks automatically.
+	auto *idwt_enc = cmd->computeCommandEncoder(MTL::DispatchTypeConcurrent);
 	if (!idwt_enc)
 		return PYROWAVE_ERROR_GENERIC;
 
