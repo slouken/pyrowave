@@ -401,6 +401,7 @@ int main(int argc, char **argv)
 		{ "1920x1080 420", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
 		{ "1920x1080 444", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_444, PlanarSurface },
 		{ "3840x2160 420", 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
+		{ "3840x2160 444", 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_444, PlanarSurface },
 		// The remaining cases repeat a geometry already above so the input paths can be
 		// priced against each other rather than against nothing. Biplanar NV12 reads
 		// chroma through swizzled RG8 views instead of two R8 textures, which is the

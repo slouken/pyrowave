@@ -815,7 +815,22 @@ int main()
 	test_encode_round_trip(device, mtl, queue, 1024, 128,
 	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
 
+	// 4K is the primary target, so it gets covered in both chroma modes and through
+	// the biplanar NV12 surface, not just extrapolated from 1080p. Note the encoder's
+	// scratch buffers reach ~109 MB at 4K 4:2:0 and ~139 MB at 4:4:4, so these cases
+	// also exercise allocation sizes nothing smaller reaches.
+	test_encode_round_trip(device, mtl, queue, 3840, 2160,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::Planar, 40.0);
+	test_encode_round_trip(device, mtl, queue, 3840, 2160,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 3840, 2160,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_444, EncodeInput::Surfaces, 40.0);
+	// Also 4K that is not a multiple of 32 in either dimension.
+	test_encode_round_trip(device, mtl, queue, 3838, 2158,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+
 	// And the assertion that actually pins the swizzle down.
+	test_input_paths_agree(device, mtl, queue, 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_420);
 	test_input_paths_agree(device, mtl, queue, 640, 480, PYROWAVE_CHROMA_SUBSAMPLING_420);
 	test_input_paths_agree(device, mtl, queue, 1918, 1078, PYROWAVE_CHROMA_SUBSAMPLING_420);
 	test_input_paths_agree(device, mtl, queue, 640, 480, PYROWAVE_CHROMA_SUBSAMPLING_444);
