@@ -7,6 +7,7 @@
 #include "device.hpp"
 #include "context.hpp"
 #include "pyrowave_encoder.hpp"
+#include <chrono>
 #include "pyrowave_decoder.hpp"
 #include "yuv4mpeg.hpp"
 #include "shaders/slangmosh.hpp"
@@ -18,12 +19,23 @@ static std::vector<uint8_t> example_payload;
 
 static void run_decoder_test(Device &device, PyroWave::Decoder &dec, const PyroWave::ViewBuffers &output)
 {
-	for (uint32_t i = 0; i < 10000; i++)
+	// Same instrumentation as the encoder loop: KosmicKrisp has no timestamps, and a
+	// single bracket around the loop body cannot tell CPU-busy from CPU-blocked-in-
+	// next_frame_context, so the segments are timed separately.
+	uint32_t iterations = 10000;
+	if (const char *env = getenv("PYROWAVE_BENCH_ITERATIONS"))
+		iterations = uint32_t(strtoul(env, nullptr, 0));
+	double parse_ms = 0.0, record_ms = 0.0, submit_ms = 0.0, context_ms = 0.0;
+	auto wall_start = std::chrono::steady_clock::now();
+
+	for (uint32_t i = 0; i < iterations; i++)
 	{
+		auto t_a = std::chrono::steady_clock::now();
 		dec.clear();
 		dec.push_packet(example_payload.data(), example_payload.size());
 		if (!dec.decode_is_ready(false))
 			return;
+		auto t_b = std::chrono::steady_clock::now();
 
 		auto cmd = device.request_command_buffer();
 
@@ -50,9 +62,23 @@ static void run_decoder_test(Device &device, PyroWave::Decoder &dec, const PyroW
 		dec.decode(*cmd, output);
 		auto end_ts = cmd->write_timestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 		device.register_time_interval("GPU", std::move(start_ts), std::move(end_ts), "Overall Decode");
+		auto t_c = std::chrono::steady_clock::now();
 		device.submit(cmd);
+		auto t_d = std::chrono::steady_clock::now();
 		device.next_frame_context();
-		//LOGI("Submitted decoder frame %05u ...\n", i);
+		auto t_e = std::chrono::steady_clock::now();
+		parse_ms += std::chrono::duration<double, std::milli>(t_b - t_a).count();
+		record_ms += std::chrono::duration<double, std::milli>(t_c - t_b).count();
+		submit_ms += std::chrono::duration<double, std::milli>(t_d - t_c).count();
+		context_ms += std::chrono::duration<double, std::milli>(t_e - t_d).count();
+	}
+
+	{
+		double ms = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - wall_start).count();
+		double n = double(iterations);
+		LOGI("Decode: wall %.3f | parse %.3f  record %.3f  submit %.3f  frame-context(GPU wait) %.3f ms/frame\n",
+		     ms / n, parse_ms / n, record_ms / n, submit_ms / n, context_ms / n);
 	}
 }
 
@@ -86,30 +112,69 @@ static void run_encoder_test(Device &device,
 
 	Fence fence;
 
-	for (uint32_t i = 0; i < 10000; i++)
+	// KosmicKrisp reports no timestamp support, so also wall clock the whole
+	// saturated loop; on a GPU bound workload that is GPU seconds per frame.
+	uint32_t iterations = 10000;
+	if (const char *env = getenv("PYROWAVE_BENCH_ITERATIONS"))
+		iterations = uint32_t(strtoul(env, nullptr, 0));
+	// PYROWAVE_BENCH_NULL submits the same command buffers with no encode work in
+	// them, which prices the loop's own overhead: driver command buffer translation,
+	// submission and Granite's frame contexts.
+	const bool null_mode = getenv("PYROWAVE_BENCH_NULL") != nullptr;
+	// Accumulating the time spent inside the loop body separates "the CPU cannot feed
+	// the GPU fast enough" from "the GPU is the limit". If this approaches the total
+	// wall time the loop is CPU bound and the GPU time is hidden, in which case
+	// subtracting an overhead figure from the wall time is meaningless.
+	double record_ms = 0.0, submit_ms = 0.0, context_ms = 0.0;
+	auto wall_start = std::chrono::steady_clock::now();
+
+	for (uint32_t i = 0; i < iterations; i++)
 	{
+		auto t_a = std::chrono::steady_clock::now();
 		auto cmd = device.request_command_buffer(CommandBuffer::Type::AsyncCompute);
 		auto start_ts = cmd->write_timestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-		enc.encode(*cmd, inputs, buffers);
-		cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-					 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+		if (!null_mode)
+		{
+			enc.encode(*cmd, inputs, buffers);
+			cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+			             VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+		}
 		auto end_ts = cmd->write_timestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 		device.register_time_interval("GPU", std::move(start_ts), std::move(end_ts), "Overall Encode");
 		start_ts = cmd->write_timestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-		cmd->copy_buffer(*bitstream_host, *bitstream);
-		cmd->copy_buffer(*meta_host, *meta);
-		cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-		             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-					 VK_ACCESS_HOST_READ_BIT);
+		if (!null_mode)
+		{
+			cmd->copy_buffer(*bitstream_host, *bitstream);
+			cmd->copy_buffer(*meta_host, *meta);
+			cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+			             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+			             VK_ACCESS_HOST_READ_BIT);
+		}
 		end_ts = cmd->write_timestamp(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 		device.register_time_interval("GPU", std::move(start_ts), std::move(end_ts), "Bitstream Readback");
+		auto t_b = std::chrono::steady_clock::now();
 		fence.reset();
 		device.submit(cmd, &fence);
+		auto t_c = std::chrono::steady_clock::now();
+		// Granite's frame contexts are a ring, so this blocks until an older context
+		// retires -- i.e. this is where waiting on the GPU actually shows up.
 		device.next_frame_context();
-		//LOGI("Submitted encoder frame %05u ...\n", i);
+		auto t_d = std::chrono::steady_clock::now();
+		record_ms += std::chrono::duration<double, std::milli>(t_b - t_a).count();
+		submit_ms += std::chrono::duration<double, std::milli>(t_c - t_b).count();
+		context_ms += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 	}
 
 	fence->wait();
+
+	{
+		auto wall_end = std::chrono::steady_clock::now();
+		double ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
+		double n = double(iterations);
+		LOGI("Encode%s: wall %.3f | record %.3f  submit %.3f  frame-context(GPU wait) %.3f ms/frame\n",
+		     null_mode ? " (NULL)" : "",
+		     ms / n, record_ms / n, submit_ms / n, context_ms / n);
+	}
 
 	PyroWave::Encoder::Packet packet = {};
 	example_payload.resize(500000);

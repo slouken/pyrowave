@@ -10,6 +10,9 @@ Build everything with `./tools/metal/build.sh`, which drops binaries in
 bottom) and `sdl_plane_test` needs an SDL with the per plane IOSurface texture
 properties.
 
+The cross backend comparison below additionally uses `pyrowave-bench`, which is a
+normal `PYROWAVE_DEVEL` target rather than one of these tools.
+
 `bench_encode` is the one tool that needs something from the library itself: the
 encoder owns its command buffer and never hands it out, so reading `GPUStartTime`
 or swapping the dispatch type has to happen inside the backend. Those two hooks sit
@@ -87,6 +90,77 @@ Prints which `MTLCounterSamplingPoint` values the device supports.
 On an M1: **only `AtStageBoundary`.** There is no dispatch boundary sampling, so
 per dispatch timestamps cannot be collected on this hardware; use
 `dispatch_cost` or temporary phase skipping instead.
+
+## Cross backend comparison: Metal vs Vulkan on the same GPU
+
+The Vulkan build does run on this Mac, on the KosmicKrisp Vulkan driver, so the two
+backends can be compared on identical hardware rather than against a reference from a
+different GPU.
+
+    cmake -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DPYROWAVE_DEVEL=ON -DPYROWAVE_METAL=OFF
+    ninja -C build-vk pyrowave-bench
+    export VK_DRIVER_FILES=/usr/local/share/vulkan/icd.d/libkosmickrisp_icd.json
+    export GRANITE_VULKAN_LIBRARY=/usr/local/lib/libvulkan.1.dylib
+    PYROWAVE_BENCH_ITERATIONS=300 ./build-vk/pyrowave-bench input.y4m
+
+Two things are needed to get that far, both outside this repo. Granite's
+`third_party/CMakeLists.txt` adds its vendored pyrowave unconditionally under
+`GRANITE_FFMPEG`, which collides with the top level target; guard it with
+`if (NOT TARGET pyrowave)`. And `Granite/util/timer.cpp` uses `clock_nanosleep` with
+`TIMER_ABSTIME`, neither of which exists on macOS.
+
+**`GRANITE_VULKAN_LIBRARY` is mandatory.** Granite's loader does a bare
+`dlopen("libvulkan.1.dylib")`, which does not resolve `/usr/local/lib` here, and then
+returns false *silently* — the symptom is a clean exit 0 with no output and no
+message.
+
+### Results
+
+GPU time per frame, same M1, ~500 KB/frame:
+
+    config            encode Vk   encode Mtl   decode Vk   decode Mtl
+    640x480 420           2.467        0.356       0.740       0.172
+    1920x1080 420         3.972        1.301       1.376       0.541
+    3840x2160 420         8.603        4.51        2.964       1.572
+    3840x2160 444        13.513        7.81        5.018       3.046
+
+Metal is **6.9x** ahead at 480p narrowing to **1.7x** at 4K 4:4:4 for encode, and
+**4.3x** to **1.65x** for decode. That shape matches the serial versus concurrent
+dispatch measurement almost exactly, and Vulkan is still 2.6x / 2.1x / 1.6x slower
+than *serialized* Metal, so dispatch concurrency explains part of the gap and
+KosmicKrisp's shader codegen the rest.
+
+### Reading the Vulkan numbers
+
+KosmicKrisp reports no timestamp support, so `write_timestamp` yields nothing and the
+repository root `bench.cpp` behind `pyrowave-bench` — not `tools/metal/bench.cpp` —
+also wall clocks its loops. It reports four segments per frame, because a
+single bracket around the loop body cannot tell a busy CPU from one **blocked** inside
+`next_frame_context()` — Granite's frame contexts are a ring, so that call waits for an
+older context to retire, which is where GPU time actually shows up. My first attempt
+made exactly that mistake and reported "cpu-in-loop is 100% of wall", which looks like
+a CPU bound loop and is not.
+
+**Do not subtract the CPU cost from the wall time.** For 4K 4:2:0 encode the segments
+are record 0.210, submit 0.491, frame-context 7.874. `record` is KosmicKrisp
+translating the ~170 dispatches and is *constant* across resolution, as expected since
+the dispatch count barely varies with frame size. `PYROWAVE_BENCH_NULL=1` submits the
+same command buffers with the encode work removed and costs 0.083 ms/frame, so the
+harness is free. The CPU work is overlapped with GPU execution, so wall per frame
+already *is* GPU time per frame; subtracting would double count. An earlier guess that
+there was a ~2 ms fixed CPU floor, inferred from 480p to 1080p scaling only 1.6x
+against a 6.75x area ratio, was wrong — the 480p figure is genuine GPU time.
+
+### Caveats
+
+- The Vulkan decoder takes fallback paths here: it logs "Using texel buffers instead
+  of SSBO" and "Using linear textures instead of texel buffers", so this is not the
+  code path a desktop GPU would run.
+- Shader compiles are slow, 240-280 ms per pipeline on first use.
+- Decoding the same stream with both decoders at `PYROWAVE_PRECISION=2` **on the same
+  GPU** still differs by 30 pixels over 4 frames at 480p, all off by one. The residual
+  1 LSB is therefore independent float codegen, not the hardware difference it was
+  originally attributed to.
 
 ## SDL / IOSurface investigation
 
