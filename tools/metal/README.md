@@ -151,6 +151,28 @@ already *is* GPU time per frame; subtracting would double count. An earlier gues
 there was a ~2 ms fixed CPU floor, inferred from 480p to 1080p scaling only 1.6x
 against a 6.75x area ratio, was wrong — the 480p figure is genuine GPU time.
 
+### Running either backend at a different precision
+
+`PYROWAVE_PRECISION` (0, 1, 2; default 1) is read at runtime on both sides, so no
+rebuild is needed for either encode or decode:
+
+    for p in 2 1 0; do PYROWAVE_PRECISION=$p build-tools/bench_encode 300; done
+    for p in 2 1 0; do PYROWAVE_PRECISION=$p build-tools/bench samples/stream_1080p_high.bin; done
+    for p in 2 1 0; do PYROWAVE_PRECISION=$p ./build-vk/pyrowave-bench input.y4m; done
+
+The Vulkan encoder used to pick its DWT shader from the compile time
+`PYROWAVE_PRECISION` while everything else followed `Configuration`, so the env var
+produced a mismatched configuration for encode; that is fixed, and the equivalent
+CMake options (`PYROWAVE_FP32_STORAGE` for 2, `PYROWAVE_FP32_MATH` for 1, neither for
+0) now only change the default.
+
+**Compare decoded output, never the bitstream.** Two runs of one binary in one
+configuration already produce different bytes: the unused bits of a block's final sign
+byte come from `shared_sign_bank` in `block_packing.comp`, which is never initialized.
+The decode is deterministic; the bitstream is not. A `cmp` on the bitstream cannot
+distinguish two configurations, and will happily suggest a difference that is not
+there.
+
 ### Caveats
 
 - The Vulkan decoder takes fallback paths here: it logs "Using texel buffers instead
