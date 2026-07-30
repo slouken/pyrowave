@@ -204,7 +204,10 @@ static double plane_psnr(MTL::Texture *tex, const std::vector<uint8_t> &referenc
 	return mse == 0.0 ? 1000.0 : 10.0 * std::log10(255.0 * 255.0 / mse);
 }
 
-enum class EncodeInput { Planar, NV12, Surfaces };
+// The four ways a frame can reach the encoder. NV12Surface -- one biplanar '420v'
+// IOSurface, chroma reached through a pair of swizzled RG8 views -- is a primary
+// path: it is what a camera or a hardware decoder hands over.
+enum class EncodeInput { Planar, NV12, Surfaces, NV12Surface };
 
 // Walks a packet's concatenated block headers, skipping any sequence header.
 static size_t count_blocks_in_packet(const uint8_t *data, size_t size)
@@ -264,12 +267,71 @@ static IOSurfaceRef make_r8_surface(const uint8_t *src, int width, int height)
 	return surface;
 }
 
+// A biplanar '420v' surface: R8 luma in plane 0, interleaved RG8 chroma in plane 1.
+static IOSurfaceRef make_nv12_surface(const uint8_t *luma, const uint8_t *chroma,
+                                      int width, int height)
+{
+	CFMutableDictionaryRef plane0 = CFDictionaryCreateMutable(kCFAllocatorDefault, 3,
+	                                                          &kCFTypeDictionaryKeyCallBacks,
+	                                                          &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(plane0, kIOSurfacePlaneWidth, width);
+	dict_set_int(plane0, kIOSurfacePlaneHeight, height);
+	dict_set_int(plane0, kIOSurfacePlaneBytesPerElement, 1);
+
+	CFMutableDictionaryRef plane1 = CFDictionaryCreateMutable(kCFAllocatorDefault, 3,
+	                                                          &kCFTypeDictionaryKeyCallBacks,
+	                                                          &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(plane1, kIOSurfacePlaneWidth, width / 2);
+	dict_set_int(plane1, kIOSurfacePlaneHeight, height / 2);
+	dict_set_int(plane1, kIOSurfacePlaneBytesPerElement, 2);
+
+	const void *planes[] = { plane0, plane1 };
+	CFArrayRef plane_array = CFArrayCreate(kCFAllocatorDefault, planes, 2, &kCFTypeArrayCallBacks);
+
+	CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 4,
+	                                                         &kCFTypeDictionaryKeyCallBacks,
+	                                                         &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(props, kIOSurfaceWidth, width);
+	dict_set_int(props, kIOSurfaceHeight, height);
+	dict_set_int(props, kIOSurfacePixelFormat, int('420v'));
+	CFDictionarySetValue(props, kIOSurfacePlaneInfo, plane_array);
+
+	IOSurfaceRef surface = IOSurfaceCreate(props);
+	CFRelease(props);
+	CFRelease(plane_array);
+	CFRelease(plane1);
+	CFRelease(plane0);
+
+	if (!surface)
+		return nullptr;
+
+	IOSurfaceLock(surface, 0, nullptr);
+	for (int plane = 0; plane < 2; plane++)
+	{
+		const uint8_t *src = plane == 0 ? luma : chroma;
+		// Both planes are `width` bytes per row: luma is width x 1 byte, chroma is
+		// width/2 Cb,Cr pairs at 2 bytes each.
+		const int row_bytes = width;
+		const int rows = plane == 0 ? height : height / 2;
+		auto *dst = static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(surface, plane));
+		const size_t stride = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+		for (int y = 0; y < rows; y++)
+			memcpy(dst + size_t(y) * stride, src + size_t(y) * row_bytes, size_t(row_bytes));
+	}
+	IOSurfaceUnlock(surface, 0, nullptr);
+
+	return surface;
+}
+
+// `out_planes`, when non-NULL, receives the decoded plane data so callers can check
+// that different input paths agree exactly rather than merely both being plausible.
 static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL::CommandQueue *queue,
                                    int width, int height, pyrowave_chroma_subsampling chroma,
-                                   EncodeInput input_kind, double min_psnr)
+                                   EncodeInput input_kind, double min_psnr,
+                                   std::vector<std::vector<float>> *out_planes = nullptr)
 {
 	const bool is_420 = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420;
-	static const char *kind_names[] = { "planar", "nv12", "iosurface" };
+	static const char *kind_names[] = { "planar", "nv12", "iosurface", "nv12-iosurface" };
 	const char *kind = kind_names[int(input_kind)];
 	char label[64];
 	snprintf(label, sizeof(label), "%dx%d %s %s", width, height, is_420 ? "420" : "444", kind);
@@ -296,19 +358,34 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 	rate_control.maximum_bitstream_size = size_t(width) * height / 2;
 
 	IOSurfaceRef surfaces[3] = {};
-	if (input_kind == EncodeInput::Surfaces)
+	if (input_kind == EncodeInput::Surfaces || input_kind == EncodeInput::NV12Surface)
 	{
-		for (int i = 0; i < 3; i++)
+		pyrowave_gpu_input input = {};
+
+		if (input_kind == EncodeInput::NV12Surface)
 		{
-			const int w = i == 0 ? width : frame.chroma_width;
-			const int h = i == 0 ? height : frame.chroma_height;
-			surfaces[i] = make_r8_surface(frame.planes[i].data(), w, h);
-			CHECK(surfaces[i] != nullptr, "%s: IOSurface %d creation failed", label, i);
+			// One biplanar surface; planes[1] and [2] stay NULL, and the library
+			// takes the chroma apart with a pair of swizzled RG8 views.
+			surfaces[0] = make_nv12_surface(frame.planes[0].data(),
+			                                frame.chroma_interleaved.data(), width, height);
+			CHECK(surfaces[0] != nullptr, "%s: NV12 IOSurface creation failed", label);
+			if (!surfaces[0])
+				return;
+			input.planes[0] = surfaces[0];
+		}
+		else
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				const int w = i == 0 ? width : frame.chroma_width;
+				const int h = i == 0 ? height : frame.chroma_height;
+				surfaces[i] = make_r8_surface(frame.planes[i].data(), w, h);
+				CHECK(surfaces[i] != nullptr, "%s: IOSurface %d creation failed", label, i);
+			}
+			for (int i = 0; i < 3; i++)
+				input.planes[i] = surfaces[i];
 		}
 
-		pyrowave_gpu_input input = {};
-		for (int i = 0; i < 3; i++)
-			input.planes[i] = surfaces[i];
 		res = pyrowave_encoder_encode_gpu_synchronous(encoder, &input, &rate_control);
 	}
 	else
@@ -424,6 +501,19 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 		      label, i, psnr, min_psnr);
 	}
 
+	if (out_planes)
+	{
+		out_planes->resize(3);
+		for (int i = 0; i < 3; i++)
+		{
+			const int w = int(planes[i]->width());
+			const int h = int(planes[i]->height());
+			(*out_planes)[i].assign(size_t(w) * h, 0.0f);
+			planes[i]->getBytes((*out_planes)[i].data(), w * sizeof(float),
+			                    MTL::Region(0, 0, w, h), 0);
+		}
+	}
+
 	for (auto *plane : planes)
 		plane->release();
 	for (auto surface : surfaces)
@@ -431,6 +521,60 @@ static void test_encode_round_trip(pyrowave_device device, MTL::Device *mtl, MTL
 			CFRelease(surface);
 	pyrowave_decoder_destroy(decoder);
 	pyrowave_encoder_destroy(encoder);
+}
+
+// The delivery mechanism must not change the result. Identical input pixels produce
+// identical wavelet coefficients, so identical quantization and rate control
+// decisions, so a bit-identical decode -- whatever route the pixels took in. This is
+// the real test of the NV12 swizzle: a channel mix-up survives a PSNR threshold but
+// cannot survive this.
+static void test_input_paths_agree(pyrowave_device device, MTL::Device *mtl, MTL::CommandQueue *queue,
+                                   int width, int height, pyrowave_chroma_subsampling chroma)
+{
+	const bool is_420 = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420;
+	printf("-- input paths agree exactly: %dx%d %s\n", width, height, is_420 ? "420" : "444");
+
+	// NV12 carries half resolution chroma, so those two only apply to 4:2:0.
+	std::vector<EncodeInput> kinds = { EncodeInput::Planar, EncodeInput::Surfaces };
+	if (is_420)
+	{
+		kinds.push_back(EncodeInput::NV12);
+		kinds.push_back(EncodeInput::NV12Surface);
+	}
+
+	static const char *kind_names[] = { "planar", "nv12", "iosurface", "nv12-iosurface" };
+
+	std::vector<std::vector<float>> reference;
+	for (size_t k = 0; k < kinds.size(); k++)
+	{
+		std::vector<std::vector<float>> got;
+		test_encode_round_trip(device, mtl, queue, width, height, chroma, kinds[k], 40.0, &got);
+
+		if (k == 0)
+		{
+			reference = std::move(got);
+			continue;
+		}
+
+		CHECK(got.size() == reference.size(), "%s: plane count mismatch", kind_names[int(kinds[k])]);
+		for (size_t i = 0; i < got.size() && i < reference.size(); i++)
+		{
+			size_t differing = 0;
+			float worst = 0.0f;
+			for (size_t p = 0; p < got[i].size() && p < reference[i].size(); p++)
+			{
+				if (got[i][p] != reference[i][p])
+				{
+					differing++;
+					worst = std::max(worst, std::fabs(got[i][p] - reference[i][p]));
+				}
+			}
+			CHECK(differing == 0,
+			      "%s plane %zu: %zu/%zu samples differ from the planar path (worst %g); "
+			      "the input path changed the result",
+			      kind_names[int(kinds[k])], i, differing, got[i].size(), double(worst));
+		}
+	}
 }
 
 int main()
@@ -654,6 +798,27 @@ int main()
 	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::Planar, 40.0);
 	test_encode_round_trip(device, mtl, queue, 1919, 1077,
 	                       PYROWAVE_CHROMA_SUBSAMPLING_444, EncodeInput::Surfaces, 40.0);
+
+	// Biplanar NV12 IOSurface is a primary path -- what a camera or hardware decoder
+	// hands over -- so it gets the widest spread of geometries: aligned, neither
+	// dimension a multiple of 32, small, and wide-and-short.
+	test_encode_round_trip(device, mtl, queue, 1920, 1080,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 1918, 1078,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 1280, 720,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 640, 480,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 160, 128,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+	test_encode_round_trip(device, mtl, queue, 1024, 128,
+	                       PYROWAVE_CHROMA_SUBSAMPLING_420, EncodeInput::NV12Surface, 40.0);
+
+	// And the assertion that actually pins the swizzle down.
+	test_input_paths_agree(device, mtl, queue, 640, 480, PYROWAVE_CHROMA_SUBSAMPLING_420);
+	test_input_paths_agree(device, mtl, queue, 1918, 1078, PYROWAVE_CHROMA_SUBSAMPLING_420);
+	test_input_paths_agree(device, mtl, queue, 640, 480, PYROWAVE_CHROMA_SUBSAMPLING_444);
 
 	printf("-- encoder validation\n");
 	{

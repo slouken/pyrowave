@@ -90,6 +90,57 @@ IOSurfaceRef make_surface(const uint8_t *src, int width, int height)
 	return surface;
 }
 
+// A biplanar '420v' surface: R8 luma in plane 0, interleaved RG8 chroma in plane 1.
+IOSurfaceRef make_nv12_surface(const uint8_t *luma, const uint8_t *chroma, int width, int height)
+{
+	CFMutableDictionaryRef plane0 = CFDictionaryCreateMutable(kCFAllocatorDefault, 3,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(plane0, kIOSurfacePlaneWidth, width);
+	dict_set_int(plane0, kIOSurfacePlaneHeight, height);
+	dict_set_int(plane0, kIOSurfacePlaneBytesPerElement, 1);
+
+	CFMutableDictionaryRef plane1 = CFDictionaryCreateMutable(kCFAllocatorDefault, 3,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(plane1, kIOSurfacePlaneWidth, width / 2);
+	dict_set_int(plane1, kIOSurfacePlaneHeight, height / 2);
+	dict_set_int(plane1, kIOSurfacePlaneBytesPerElement, 2);
+
+	const void *planes[] = { plane0, plane1 };
+	CFArrayRef plane_array = CFArrayCreate(kCFAllocatorDefault, planes, 2, &kCFTypeArrayCallBacks);
+
+	CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 4,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	dict_set_int(props, kIOSurfaceWidth, width);
+	dict_set_int(props, kIOSurfaceHeight, height);
+	dict_set_int(props, kIOSurfacePixelFormat, int('420v'));
+	CFDictionarySetValue(props, kIOSurfacePlaneInfo, plane_array);
+
+	IOSurfaceRef surface = IOSurfaceCreate(props);
+	CFRelease(props);
+	CFRelease(plane_array);
+	CFRelease(plane1);
+	CFRelease(plane0);
+
+	if (!surface)
+		return nullptr;
+
+	IOSurfaceLock(surface, 0, nullptr);
+	for (int plane = 0; plane < 2; plane++)
+	{
+		// Both planes are `width` bytes per row: luma is width x 1 byte, chroma is
+		// width/2 Cb,Cr pairs at 2 bytes each.
+		const uint8_t *src = plane == 0 ? luma : chroma;
+		const int rows = plane == 0 ? height : height / 2;
+		auto *dst = static_cast<uint8_t *>(IOSurfaceGetBaseAddressOfPlane(surface, plane));
+		const size_t stride = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+		for (int y = 0; y < rows; y++)
+			memcpy(dst + size_t(y) * stride, src + size_t(y) * width, size_t(width));
+	}
+	IOSurfaceUnlock(surface, 0, nullptr);
+
+	return surface;
+}
+
 struct Samples
 {
 	std::vector<double> gpu_ms;
@@ -107,16 +158,22 @@ struct Samples
 	}
 };
 
+// How the frame reaches the encoder. NV12Surface is one biplanar '420v' surface
+// whose chroma the library reads through a pair of swizzled RG8 views; the others
+// are three single plane R8 surfaces, or host memory.
+enum InputKind { PlanarSurface, NV12Surface, CpuPlanar, CpuNV12 };
+
 struct Case
 {
 	const char *name;
 	int width, height;
 	pyrowave_chroma_subsampling chroma;
-	bool cpu_input;
+	InputKind input;
 
 	pyrowave_encoder encoder = nullptr;
 	IOSurfaceRef surfaces[3] = {};
 	std::vector<uint8_t> planes[3];
+	std::vector<uint8_t> chroma_interleaved;
 	pyrowave_rate_control rate_control = {};
 	std::vector<uint8_t> bitstream;
 	std::vector<pyrowave_packet> packets;
@@ -154,11 +211,37 @@ struct Case
 				}
 			}
 
-			surfaces[i] = make_surface(planes[i].data(), w, h);
-			if (!surfaces[i])
+		}
+
+		// Interleaved chroma for the NV12 paths.
+		chroma_interleaved.resize(planes[1].size() * 2);
+		for (size_t i = 0; i < planes[1].size(); i++)
+		{
+			chroma_interleaved[2 * i + 0] = planes[1][i];
+			chroma_interleaved[2 * i + 1] = planes[2][i];
+		}
+
+		if (input == NV12Surface)
+		{
+			surfaces[0] = make_nv12_surface(planes[0].data(), chroma_interleaved.data(),
+			                                width, height);
+			if (!surfaces[0])
 			{
-				fprintf(stderr, "%s: IOSurface %d creation failed\n", name, i);
+				fprintf(stderr, "%s: NV12 IOSurface creation failed\n", name);
 				return false;
+			}
+		}
+		else if (input == PlanarSurface)
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				surfaces[i] = make_surface(planes[i].data(), i == 0 ? width : chroma_width(),
+				                           i == 0 ? height : chroma_height());
+				if (!surfaces[i])
+				{
+					fprintf(stderr, "%s: IOSurface %d creation failed\n", name, i);
+					return false;
+				}
 			}
 		}
 
@@ -197,27 +280,47 @@ struct Case
 		const auto t0 = Clock::now();
 
 		pyrowave_result res;
-		if (cpu_input)
+		if (input == CpuPlanar || input == CpuNV12)
 		{
 			pyrowave_cpu_buffer buffer = {};
 			buffer.width = width;
 			buffer.height = height;
-			buffer.format = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 ?
-			                PYROWAVE_CPU_BUFFER_FORMAT_YUV420P : PYROWAVE_CPU_BUFFER_FORMAT_YUV444P;
-			for (int i = 0; i < 3; i++)
+
+			if (input == CpuNV12)
 			{
-				buffer.data[i] = planes[i].data();
-				buffer.row_stride_in_bytes[i] = size_t(i == 0 ? width : chroma_width());
-				buffer.plane_size_in_bytes[i] = planes[i].size();
+				buffer.format = PYROWAVE_CPU_BUFFER_FORMAT_NV12;
+				buffer.data[0] = planes[0].data();
+				buffer.row_stride_in_bytes[0] = size_t(width);
+				buffer.plane_size_in_bytes[0] = planes[0].size();
+				buffer.data[1] = chroma_interleaved.data();
+				buffer.row_stride_in_bytes[1] = size_t(chroma_width()) * 2;
+				buffer.plane_size_in_bytes[1] = chroma_interleaved.size();
+			}
+			else
+			{
+				buffer.format = chroma == PYROWAVE_CHROMA_SUBSAMPLING_420 ?
+				                PYROWAVE_CPU_BUFFER_FORMAT_YUV420P :
+				                PYROWAVE_CPU_BUFFER_FORMAT_YUV444P;
+				for (int i = 0; i < 3; i++)
+				{
+					buffer.data[i] = planes[i].data();
+					buffer.row_stride_in_bytes[i] = size_t(i == 0 ? width : chroma_width());
+					buffer.plane_size_in_bytes[i] = planes[i].size();
+				}
 			}
 			res = pyrowave_encoder_encode_cpu_synchronous(encoder, &buffer, &rate_control);
 		}
 		else
 		{
-			pyrowave_gpu_input input = {};
-			for (int i = 0; i < 3; i++)
-				input.planes[i] = surfaces[i];
-			res = pyrowave_encoder_encode_gpu_synchronous(encoder, &input, &rate_control);
+			pyrowave_gpu_input gpu = {};
+			// The NV12 case leaves planes[1] and [2] NULL on purpose.
+			gpu.planes[0] = surfaces[0];
+			if (input == PlanarSurface)
+			{
+				gpu.planes[1] = surfaces[1];
+				gpu.planes[2] = surfaces[2];
+			}
+			res = pyrowave_encoder_encode_gpu_synchronous(encoder, &gpu, &rate_control);
 		}
 
 		if (res != PYROWAVE_SUCCESS)
@@ -293,14 +396,20 @@ int main(int argc, char **argv)
 	}
 
 	std::vector<Case> cases = {
-		{ "640x480 420",   640,  480,  PYROWAVE_CHROMA_SUBSAMPLING_420, false },
-		{ "1280x720 420",  1280, 720,  PYROWAVE_CHROMA_SUBSAMPLING_420, false },
-		{ "1920x1080 420", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, false },
-		{ "1920x1080 444", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_444, false },
-		{ "3840x2160 420", 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_420, false },
-		// Same geometry as above, fed from host memory instead, to price the upload
-		// against the IOSurface path.
-		{ "1920x1080 420 cpu-input", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, true },
+		{ "640x480 420",   640,  480,  PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
+		{ "1280x720 420",  1280, 720,  PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
+		{ "1920x1080 420", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
+		{ "1920x1080 444", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_444, PlanarSurface },
+		{ "3840x2160 420", 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_420, PlanarSurface },
+		// The remaining cases repeat a geometry already above so the input paths can be
+		// priced against each other rather than against nothing. Biplanar NV12 reads
+		// chroma through swizzled RG8 views instead of two R8 textures, which is the
+		// difference worth measuring.
+		{ "640x480 420 nv12-surf",   640,  480,  PYROWAVE_CHROMA_SUBSAMPLING_420, NV12Surface },
+		{ "1920x1080 420 nv12-surf", 1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, NV12Surface },
+		{ "3840x2160 420 nv12-surf", 3840, 2160, PYROWAVE_CHROMA_SUBSAMPLING_420, NV12Surface },
+		{ "1920x1080 420 cpu",       1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, CpuPlanar },
+		{ "1920x1080 420 cpu-nv12",  1920, 1080, PYROWAVE_CHROMA_SUBSAMPLING_420, CpuNV12 },
 	};
 
 	for (auto &c : cases)
