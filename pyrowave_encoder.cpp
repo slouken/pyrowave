@@ -496,8 +496,12 @@ bool Encoder::Impl::dwt(CommandBuffer &cmd, const ViewBuffers &views)
 		uvec2 aligned_resolution;
 	} push = {};
 
-	// Forward transforms.
-	cmd.set_program(shaders.dwt[PYROWAVE_PRECISION]);
+	// Forward transforms. Selected from Configuration rather than the compile time
+	// PYROWAVE_PRECISION, matching what Decoder::Impl::idwt does and what
+	// WaveletBuffers::allocate_images used to pick the image formats: the shader
+	// variant and the storage it writes to have to agree, and both now follow the
+	// same runtime value.
+	cmd.set_program(shaders.dwt[Configuration::get().get_precision()]);
 
 	// Only need simple 2-lane swaps.
 	cmd.set_subgroup_size_log2(true, 2, 7);
