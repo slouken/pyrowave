@@ -740,16 +740,28 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 
 	auto *cmd = static_cast<MTL::CommandBuffer *>(command_buffer);
 
-	// A serial dispatch encoder gives automatic hazard tracking, which covers the
-	// dequant to iDWT dependency and the chain between iDWT levels.
-	auto *enc = cmd->computeCommandEncoder();
-	if (!enc)
+	// Every dequant dispatch writes a distinct (component, level, band) region of
+	// the pyramid and none reads another's output, so they can all run at once. A
+	// serial encoder would put a full barrier between each of the ~42 of them,
+	// which dominates the frame at low resolutions where the dispatches are tiny.
+	auto *dequant_enc = cmd->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+	if (!dequant_enc)
 		return PYROWAVE_ERROR_GENERIC;
 
-	enc->setLabel(NS::String::string("pyrowave decode", NS::UTF8StringEncoding));
-	encode_dequant(decoder, enc, slot);
-	encode_idwt(decoder, enc, planes);
-	enc->endEncoding();
+	dequant_enc->setLabel(NS::String::string("pyrowave dequant", NS::UTF8StringEncoding));
+	encode_dequant(decoder, dequant_enc, slot);
+	dequant_enc->endEncoding();
+
+	// The iDWT stays serial: each level consumes the previous level's output.
+	// Ordering against the dequant work above comes from the encoder boundary,
+	// which Metal tracks automatically.
+	auto *idwt_enc = cmd->computeCommandEncoder();
+	if (!idwt_enc)
+		return PYROWAVE_ERROR_GENERIC;
+
+	idwt_enc->setLabel(NS::String::string("pyrowave idwt", NS::UTF8StringEncoding));
+	encode_idwt(decoder, idwt_enc, planes);
+	idwt_enc->endEncoding();
 
 	slot->in_flight.store(true, std::memory_order_release);
 	cmd->addCompletedHandler([slot](MTL::CommandBuffer *) {
