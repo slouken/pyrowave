@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <stdlib.h>
 #include <string.h>
 
 using namespace PyroWave;
@@ -159,6 +160,32 @@ float get_quant_rdo_distortion_scale(int level, int component, int band, int pre
 	return weighted_resolution * weighted_resolution;
 }
 
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+// Lets tools/metal/bench_encode.cpp measure the concurrent encoder against a
+// serial one. Re-read per call rather than cached, so the tool can interleave the
+// two modes within a single run -- this machine's background GPU load drifts
+// enough between runs to fake a result otherwise.
+bool bench_serial_dispatch()
+{
+	const char *env = getenv("PYROWAVE_BENCH_SERIAL");
+	return env && env[0] == '1';
+}
+#else
+constexpr bool bench_serial_dispatch()
+{
+	return false;
+}
+#endif
+
+// A serial encoder already orders every dispatch against the previous one, so the
+// explicit barriers are only needed, and only legal, on a concurrent encoder.
+// Outside a benchmark build this folds away and the barrier is unconditional.
+void stage_barrier(MTL::ComputeCommandEncoder *enc, MTL::BarrierScope scope)
+{
+	if (!bench_serial_dispatch())
+		enc->memoryBarrier(scope);
+}
+
 uint32_t floor_log2(uint32_t v)
 {
 	uint32_t result = 0;
@@ -231,6 +258,11 @@ struct pyrowave_encoder_opaque
 	// something to block on.
 	MTL::CommandBuffer *pending = nullptr;
 	bool have_result = false;
+
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+	// GPU execution time of the last completed encode, in milliseconds.
+	double bench_last_gpu_ms = 0.0;
+#endif
 
 	uint32_t sequence_count = 0;
 
@@ -583,7 +615,7 @@ void dispatch_dwt(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *enc,
 		// Each level transforms the LL band the previous one produced, so the levels
 		// are a dependent chain. The components within a level are independent.
 		if (output_level != 0)
-			enc->memoryBarrier(MTL::BarrierScopeTextures);
+			stage_barrier(enc, MTL::BarrierScopeTextures);
 
 		DwtPush level_push = {};
 		if (output_level == 0)
@@ -742,7 +774,7 @@ void dispatch_analyze_rdo(pyrowave_encoder encoder, MTL::ComputeCommandEncoder *
 	});
 
 	// The finalize pass prefix sums the buckets the dispatches above filled.
-	enc->memoryBarrier(MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTL::BarrierScopeBuffers);
 	enc->setComputePipelineState(encoder->device->analyze_finalize_pipeline);
 	enc->setBuffer(encoder->bucket_buffer, 0, 0);
 	enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
@@ -861,22 +893,23 @@ pyrowave_result encode_frame(pyrowave_encoder encoder, MTL::Texture *const plane
 	// where the Vulkan encoder has them. Everything between two barriers is
 	// mutually independent -- each dispatch owns a distinct (component, level, band)
 	// region -- and a serial encoder would barrier between all ~170 of them.
-	auto *enc = cmd->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+	auto *enc = cmd->computeCommandEncoder(bench_serial_dispatch() ? MTL::DispatchTypeSerial
+	                                                               : MTL::DispatchTypeConcurrent);
 	if (!enc)
 		return PYROWAVE_ERROR_GENERIC;
 	enc->setLabel(NS::String::string("pyrowave encode", NS::UTF8StringEncoding));
 
 	dispatch_dwt(encoder, enc, planes);
 	// The quantizer samples the coefficients the DWT just wrote.
-	enc->memoryBarrier(MTL::BarrierScopeTextures);
+	stage_barrier(enc, MTL::BarrierScopeTextures);
 	dispatch_quant(encoder, enc);
 	// Rate control analysis reads the per block statistics and payload sizes.
-	enc->memoryBarrier(MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTL::BarrierScopeBuffers);
 	dispatch_analyze_rdo(encoder, enc);
-	enc->memoryBarrier(MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTL::BarrierScopeBuffers);
 	dispatch_resolve_rdo(encoder, enc, target_size);
 	// Packing needs the quant decisions resolve just made.
-	enc->memoryBarrier(MTL::BarrierScopeBuffers);
+	stage_barrier(enc, MTL::BarrierScopeBuffers);
 	dispatch_block_packing(encoder, enc);
 
 	enc->endEncoding();
@@ -902,6 +935,11 @@ pyrowave_result wait_for_result(pyrowave_encoder encoder)
 	if (encoder->pending)
 	{
 		encoder->pending->waitUntilCompleted();
+
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+		encoder->bench_last_gpu_ms =
+				(encoder->pending->GPUEndTime() - encoder->pending->GPUStartTime()) * 1000.0;
+#endif
 
 		if (encoder->pending->status() == MTL::CommandBufferStatusError)
 		{
@@ -1215,3 +1253,13 @@ pyrowave_result pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_pa
 	                         encoder->bitstream_meta->contents(), encoder->bitstream->contents());
 	return PYROWAVE_SUCCESS;
 }
+
+#ifdef PYROWAVE_METAL_BENCH_HOOKS
+// Not in pyrowave_metal.h: the encoder owns its command buffer and deliberately
+// does not hand it out, so there is no way for a caller to time the GPU work
+// itself. tools/metal/bench_encode.cpp declares this extern directly.
+extern "C" double pyrowave_bench_last_gpu_ms(pyrowave_encoder encoder)
+{
+	return encoder ? encoder->bench_last_gpu_ms : -1.0;
+}
+#endif
