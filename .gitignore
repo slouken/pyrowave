@@ -2,5 +2,7 @@
 *.iml
 /.idea
 /Granite
+/metal-cpp
 /build-steamrt
 /steamrt-output
+/samples

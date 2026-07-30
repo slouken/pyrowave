@@ -1,0 +1,151 @@
+// Copyright (c) 2025 Hans-Kristian Arntzen
+// SPDX-License-Identifier: MIT
+#pragma once
+
+// Granite-free CPU side of the PyroWave decoder: bitstream layout, block metadata
+// and packet parsing. Contains no graphics API dependency, so it can back either
+// the Vulkan decoder or the Metal one.
+
+#include <stddef.h>
+#include <stdint.h>
+#include <vector>
+#include "pyrowave_config.hpp"
+
+namespace PyroWave
+{
+struct BitstreamHeader
+{
+	uint16_t ballot;
+	uint16_t payload_words : 12;
+	uint16_t sequence : 3;
+	uint16_t extended : 1;
+	uint32_t quant_code : 8;
+	uint32_t block_index : 24;
+};
+
+static_assert(sizeof(BitstreamHeader) == 8, "BitstreamHeader is not 8 bytes.");
+
+struct BitstreamSequenceHeader
+{
+	uint32_t width_minus_1 : 14;
+	uint32_t height_minus_1 : 14;
+	uint32_t sequence : 3;
+	uint32_t extended : 1;
+	uint32_t total_blocks : 24;
+	uint32_t code : 2;
+	uint32_t chroma_resolution : 1;
+	uint32_t color_primaries : 1;
+	uint32_t transfer_function : 1;
+	uint32_t ycbcr_transform : 1;
+	uint32_t ycbcr_range : 1;
+	uint32_t chroma_siting : 1;
+};
+
+static_assert(sizeof(BitstreamSequenceHeader) == 8, "BitstreamSequenceHeader is not 8 bytes.");
+
+enum
+{
+	BITSTREAM_EXTENDED_CODE_START_OF_FRAME = 0,
+};
+
+static constexpr uint32_t SequenceCountMask = 0x7;
+
+static constexpr int DecompositionLevels = 5;
+static constexpr int Alignment = 1 << DecompositionLevels;
+// If the final decomposition band is too small, the mirroring will break since it starts double mirroring.
+static constexpr int MinimumImageSize = 4 << DecompositionLevels;
+static constexpr int NumComponents = 3;
+static constexpr int NumFrequencyBandsPerLevel = 4;
+
+static inline int align(int value, int alignment)
+{
+	return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// Pure integer derivation of where every 8x8 and 32x32 block lives in the wavelet
+// image pyramid. Mirrors WaveletBuffers::init_block_meta(), but derives the mip
+// dimensions arithmetically instead of querying a Vulkan image.
+struct BlockLayout
+{
+	// Returns false if the requested dimensions cannot be represented in the bitstream.
+	bool init(int width, int height, ChromaSubsampling chroma);
+
+	struct BlockInfo
+	{
+		int block_offset_8x8;
+		int block_stride_8x8;
+		int block_offset_32x32;
+		int block_stride_32x32;
+	};
+	BlockInfo block_meta[NumComponents][DecompositionLevels][NumFrequencyBandsPerLevel] = {};
+
+	struct BlockMapping
+	{
+		int block_offset_8x8;
+		int block_stride_8x8;
+		int block_width_8x8;
+		int block_height_8x8;
+	};
+	std::vector<BlockMapping> block_32x32_to_8x8_mapping;
+
+	int block_count_8x8 = 0;
+	int block_count_32x32 = 0;
+
+	int width = 0;
+	int height = 0;
+	int aligned_width = 0;
+	int aligned_height = 0;
+
+	ChromaSubsampling chroma = ChromaSubsampling::Chroma420;
+
+	// Dimensions of mip `level` of the wavelet image, which is allocated at half
+	// the aligned frame size. Matches Vulkan::Image::get_width/get_height(lod).
+	int level_width(int level) const;
+	int level_height(int level) const;
+
+private:
+	void accumulate_block_mapping(int blocks_x_8x8, int blocks_y_8x8);
+};
+
+// Parses packets into the two flat arrays the dequant shader consumes:
+// a per-32x32-block offset table and the concatenated payload words.
+class BitstreamParser
+{
+public:
+	// `layout` must outlive the parser.
+	void init(const BlockLayout *layout);
+
+	void clear();
+
+	bool push_packet(const void *data, size_t size);
+
+	bool decode_is_ready(bool allow_partial_frame) const;
+
+	// Call once a frame has actually been submitted for decode, so the same
+	// sequence is not decoded twice.
+	void mark_frame_decoded();
+
+	// UINT32_MAX marks a block that never received a packet. Indexed by 32x32 block
+	// index, sized block_count_32x32. Upload verbatim to the dequant offset buffer.
+	const std::vector<uint32_t> &dequant_offsets() const { return dequant_offset_buffer_cpu; }
+
+	// Concatenated packet payloads, indexed by the offsets above. Note the dequant
+	// shader can read slightly past the end, so the GPU buffer needs padding.
+	const std::vector<uint32_t> &payload() const { return payload_data_cpu; }
+
+	int get_decoded_blocks() const { return decoded_blocks; }
+	int get_total_blocks_in_sequence() const { return total_blocks_in_sequence; }
+
+private:
+	const BlockLayout *layout = nullptr;
+
+	std::vector<uint32_t> dequant_offset_buffer_cpu;
+	std::vector<uint32_t> payload_data_cpu;
+	int decoded_blocks = 0;
+	int total_blocks_in_sequence = 0;
+	uint32_t last_seq = UINT32_MAX;
+	bool decoded_frame_for_current_sequence = false;
+
+	bool decode_packet(const BitstreamHeader *header);
+};
+}
