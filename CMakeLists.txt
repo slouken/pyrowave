@@ -258,6 +258,29 @@ if (PYROWAVE_METAL)
         target_include_directories(pyrowave-metal-test SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
         target_compile_options(pyrowave-metal-test PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
 
+        # SDL viewer. Needs the per plane IOSurface texture properties, so it only
+        # builds against an SDL that has them.
+        set(PYROWAVE_SDL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/Granite/third_party/sdl3)
+        if (EXISTS ${PYROWAVE_SDL_DIR}/CMakeLists.txt)
+            set(PYROWAVE_METAL_VIEWER_DEFAULT ON)
+        else()
+            set(PYROWAVE_METAL_VIEWER_DEFAULT OFF)
+        endif()
+        option(PYROWAVE_METAL_VIEWER "Build the SDL viewer for the Metal decoder."
+                ${PYROWAVE_METAL_VIEWER_DEFAULT})
+
+        if (PYROWAVE_METAL_VIEWER)
+            if (NOT TARGET SDL3::SDL3)
+                add_subdirectory(${PYROWAVE_SDL_DIR} sdl3 EXCLUDE_FROM_ALL)
+            endif()
+
+            add_executable(pyrowave-metal-viewer pyrowave_metal_viewer.cpp)
+            target_link_libraries(pyrowave-metal-viewer PRIVATE
+                    pyrowave-metal SDL3::SDL3 "-framework IOSurface")
+            target_include_directories(pyrowave-metal-viewer SYSTEM PRIVATE ${PYROWAVE_METAL_CPP_DIR})
+            target_compile_options(pyrowave-metal-viewer PRIVATE ${PYROWAVE_CXX_FLAGS} -fblocks)
+        endif()
+
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/pyrowave_metal.h
                 DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pyrowave)
     endif()
