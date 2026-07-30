@@ -5,12 +5,11 @@
 // pyrowave_encoder.cpp: dwt -> quant -> analyze_rdo -> resolve_rdo ->
 // block_packing on the GPU, then packetize on the CPU.
 //
-// Two things differ structurally from the Vulkan encoder. It owns its command
-// queue rather than taking a caller command buffer, because the packet queries
-// have to block on completion. And the result buffers are shared storage, read
-// directly by the CPU: the Vulkan side stages them through device local memory
-// because writing a bitstream into host visible memory is slow on discrete GPUs,
-// which does not apply to unified memory.
+// Two things differ structurally from the Vulkan encoder. It owns its command queue
+// rather than taking a caller command buffer, because the packet queries have to block
+// on completion. And the result buffers are shared storage read directly by the CPU;
+// the Vulkan side stages them through device local memory because host visible writes
+// are slow on discrete GPUs, which does not apply to unified memory.
 
 #include "pyrowave_metal_common.hpp"
 #include "shaders/metal/pyrowave_msl.h"
@@ -28,9 +27,8 @@ using namespace PyroWave;
 namespace
 {
 // Push constant layouts, matching the Registers structs SPIRV-Cross emitted into
-// shaders/metal/*.metal. MSL aligns int2 and float2 to 8 bytes, so several of
-// these need explicit tail padding; the sizes were checked against the generated
-// MSL with a static_assert on the Metal compiler's own layout.
+// shaders/metal/*.metal. MSL aligns int2 and float2 to 8 bytes, so several need
+// explicit tail padding.
 struct DwtPush
 {
 	int32_t resolution[2];
@@ -161,10 +159,9 @@ float get_quant_rdo_distortion_scale(int level, int component, int band, int pre
 }
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
-// Lets tools/metal/bench_encode.cpp measure the concurrent encoder against a
-// serial one. Re-read per call rather than cached, so the tool can interleave the
-// two modes within a single run -- this machine's background GPU load drifts
-// enough between runs to fake a result otherwise.
+// Lets tools/metal/bench_encode.mm measure the concurrent encoder against a serial one.
+// Re-read per call rather than cached, so the tool can interleave both modes within one
+// run -- background GPU load drifts enough between runs to fake a result otherwise.
 bool bench_serial_dispatch()
 {
 	const char *env = getenv("PYROWAVE_BENCH_SERIAL");
@@ -177,8 +174,7 @@ constexpr bool bench_serial_dispatch()
 }
 #endif
 
-// A serial encoder already orders every dispatch against the previous one, so the
-// explicit barriers are only needed, and only legal, on a concurrent encoder.
+// The explicit barriers are only needed, and only legal, on a concurrent encoder.
 // Outside a benchmark build this folds away and the barrier is unconditional.
 void stage_barrier(id<MTLComputeCommandEncoder> enc, MTLBarrierScope scope)
 {
@@ -197,9 +193,8 @@ uint32_t floor_log2(uint32_t v)
 	return result;
 }
 
-// The three single channel textures the DWT samples at level 0. For NV12 input
-// two of them are swizzled views of one interleaved chroma texture, so the
-// objects to release are tracked separately from the sampled views.
+// The three single channel textures the DWT samples at level 0. For NV12 input two are
+// swizzled views of one chroma texture, so the backing objects are tracked separately.
 struct InputTextures
 {
 	id<MTLTexture> sampled[NumComponents] = {};
@@ -258,15 +253,13 @@ struct pyrowave_encoder_opaque
 	bool have_result = false;
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
-	// GPU execution time of the last completed encode, in milliseconds.
 	double bench_last_gpu_ms = 0.0;
 #endif
 
 	uint32_t sequence_count = 0;
 
-	// No destructor needed: ARC releases every buffer, the queue and any pending
-	// command buffer, and Metal keeps anything a command buffer still references
-	// alive on its own, so an in-flight encode does not have to be waited out.
+	// No destructor: ARC releases every buffer, the queue and any pending command
+	// buffer, and Metal keeps whatever an in-flight encode still references alive.
 };
 
 namespace
@@ -286,9 +279,8 @@ bool ensure_encode_pipelines(pyrowave_device device)
 	if (device->encode_pipelines_ready)
 		return true;
 
-	// Each shader is its own MTLLibrary. They cannot be concatenated: SPIRV-Cross
-	// emits its own copy of the spv* helpers and a differently shaped Registers
-	// struct into every source.
+	// Each shader is its own MTLLibrary. They cannot be concatenated: SPIRV-Cross emits
+	// its own spv* helpers and a differently shaped Registers into every source.
 	const char *dwt_source;
 	switch (device->precision)
 	{
@@ -311,9 +303,9 @@ bool ensure_encode_pipelines(pyrowave_device device)
 		}
 	}
 
-	// SkipQuantScale is function constant 1 and wants its default of false, but
-	// Metal will not build a pipeline from an unspecialized function that declares
-	// any constants, so it has to be set explicitly.
+	// SkipQuantScale is function constant 1 and wants its default of false, but Metal
+	// will not build a pipeline from an unspecialized function that declares any
+	// constants, so it has to be set explicitly.
 	if (auto *library = compile_library(device, wavelet_quant_msl_source, "wavelet_quant"))
 	{
 		device->quant_pipeline = create_pipeline_bool_constant(
@@ -343,9 +335,8 @@ bool ensure_encode_pipelines(pyrowave_device device)
 		}
 	}
 
-	// resolve_rate_control declares its workgroup size as a specialization
-	// constant and requires it to equal the SIMD width, so the whole threadgroup
-	// is one SIMD group and its subgroup scan needs no cross-group communication.
+	// resolve_rate_control declares its workgroup size as a specialization constant and
+	// requires it to equal the SIMD width, so its subgroup scan stays within one group.
 	if (auto *library = compile_library(device, resolve_rate_control_msl_source, "resolve_rate_control"))
 	{
 		uint32_t threadgroup_size = ResolveThreadgroupSize;
@@ -444,9 +435,8 @@ bool create_encode_buffers(pyrowave_encoder encoder)
 	return encoder->bitstream_meta != nullptr;
 }
 
-// The bitstream buffer is sized per encode, since the rate control target can
-// change from frame to frame. Releasing the old one mid-flight is safe: Metal
-// keeps a buffer alive as long as a command buffer references it.
+// Sized per encode, since the rate control target can change per frame. Releasing the
+// old one mid-flight is safe: Metal keeps it alive while a command buffer references it.
 bool ensure_bitstream_buffer(pyrowave_encoder encoder, size_t size)
 {
 	if (encoder->bitstream && encoder->bitstream.length >= size)
@@ -501,11 +491,11 @@ id<MTLTexture> wrap_surface_plane(pyrowave_device device, IOSurfaceRef surface, 
 	return texture;
 }
 
-// dwt gathers the red channel of whatever it is handed, so an interleaved chroma
-// plane is bound twice with the wanted component broadcast into red. This is what
-// the Vulkan API documents for NV12 too ("pass in the same plane for Cb and Cr,
-// but use swizzle"). Note an R8 format view of an RG8 texture is impossible, 8
-// versus 16 bits per pixel, so the format stays and only the swizzle changes.
+// dwt gathers the red channel of whatever it is handed, so an interleaved chroma plane
+// is bound twice with the wanted component broadcast into red -- what the Vulkan API
+// documents for NV12 too ("pass in the same plane for Cb and Cr, but use swizzle"). An
+// R8 format view of an RG8 texture is impossible, 8 versus 16 bpp, so only the swizzle
+// changes.
 bool make_interleaved_chroma_views(pyrowave_device device, InputTextures &input, id<MTLTexture> chroma)
 {
 	static const MTLTextureSwizzle components[2] = { MTLTextureSwizzleRed, MTLTextureSwizzleGreen };
@@ -513,7 +503,12 @@ bool make_interleaved_chroma_views(pyrowave_device device, InputTextures &input,
 	for (int i = 0; i < 2; i++)
 	{
 		const auto c = components[i];
-		input.sampled[i + 1] = input.adopt([chroma newTextureViewWithPixelFormat:chroma.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1) swizzle:MTLTextureSwizzleChannelsMake(c, c, c, c)]);
+		input.sampled[i + 1] = input.adopt(
+				[chroma newTextureViewWithPixelFormat:chroma.pixelFormat
+				                         textureType:MTLTextureType2D
+				                              levels:NSMakeRange(0, 1)
+				                              slices:NSMakeRange(0, 1)
+				                             swizzle:MTLTextureSwizzleChannelsMake(c, c, c, c)]);
 
 		if (!input.sampled[i + 1])
 		{
@@ -525,8 +520,6 @@ bool make_interleaved_chroma_views(pyrowave_device device, InputTextures &input,
 	return true;
 }
 
-// Reuses the textures from the previous CPU encode when the format has not
-// changed, and rebuilds them when it has.
 bool ensure_cpu_input(pyrowave_encoder encoder, pyrowave_cpu_buffer_format format)
 {
 	if (encoder->cpu_input_format == format && encoder->cpu_input.sampled[0])
@@ -691,9 +684,8 @@ void dispatch_quant(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 		push.inv_resolution[1] = 1.0f / float(push.resolution[1]);
 		push.input_layer = float(band);
 
-		// The round trip through the 8 bit quant code is deliberate: the decoder
-		// only ever sees the code, so quantize against the value it will dequantize
-		// with rather than the ideal one.
+		// The round trip through the 8 bit quant code is deliberate: the decoder only
+		// sees the code, so quantize against what it will dequantize with.
 		const float quant_res = get_quant_resolution(level, component, band, precision);
 		push.quant_resolution = 1.0f / decode_quant(encode_quant(1.0f / quant_res));
 		push.rdo_distortion_scale =
@@ -705,7 +697,9 @@ void dispatch_quant(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 
 		[enc setTexture:encoder->wavelet.component_layer_views[component][level] atIndex:0];
 		[enc setBytes:&push length:sizeof(push) atIndex:0];
-		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(QuantThreadgroupSize, 1, 1)];
+		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32,
+		                                     (push.resolution[1] + 31) / 32, 1)
+		      threadsPerThreadgroup:MTLSizeMake(QuantThreadgroupSize, 1, 1)];
 	});
 }
 
@@ -735,7 +729,9 @@ void dispatch_analyze_rdo(pyrowave_encoder encoder, id<MTLComputeCommandEncoder>
 		push.block_index_shamt = floor_log2(uint32_t(per_subdivision));
 
 		[enc setBytes:&push length:sizeof(push) atIndex:1];
-		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(AnalyzeThreadgroupSize, 1, 1)];
+		[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32,
+		                                     (push.resolution[1] + 31) / 32, 1)
+		      threadsPerThreadgroup:MTLSizeMake(AnalyzeThreadgroupSize, 1, 1)];
 	});
 
 	// The finalize pass prefix sums the buckets the dispatches above filled.
@@ -762,7 +758,8 @@ void dispatch_resolve_rdo(pyrowave_encoder encoder, id<MTLComputeCommandEncoder>
 	[enc setBuffer:encoder->bucket_buffer offset:0 atIndex:0];
 	[enc setBytes:&push length:sizeof(push) atIndex:1];
 	[enc setBuffer:encoder->quant_buffer offset:0 atIndex:2];
-	[enc dispatchThreadgroups:MTLSizeMake(NumRDOBuckets * BlockSpaceSubdivision, 1, 1) threadsPerThreadgroup:MTLSizeMake(ResolveThreadgroupSize, 1, 1)];
+	[enc dispatchThreadgroups:MTLSizeMake(NumRDOBuckets * BlockSpaceSubdivision, 1, 1)
+	      threadsPerThreadgroup:MTLSizeMake(ResolveThreadgroupSize, 1, 1)];
 }
 
 void dispatch_block_packing(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
@@ -803,7 +800,8 @@ void dispatch_block_packing(pyrowave_encoder encoder, id<MTLComputeCommandEncode
 		// Note the /2: unlike the other stages a threadgroup covers 2x2 of the
 		// 32x32 blocks, one per 16 lanes.
 		[enc dispatchThreadgroups:MTLSizeMake((push.resolution_32x32_blocks[0] + 1) / 2,
-				          (push.resolution_32x32_blocks[1] + 1) / 2, 1) threadsPerThreadgroup:MTLSizeMake(BlockPackingThreadgroupSize, 1, 1)];
+		                                     (push.resolution_32x32_blocks[1] + 1) / 2, 1)
+		      threadsPerThreadgroup:MTLSizeMake(BlockPackingThreadgroupSize, 1, 1)];
 	});
 }
 
@@ -831,29 +829,28 @@ pyrowave_result encode_frame(pyrowave_encoder encoder, id<MTLTexture> const plan
 	auto blit = [cmd blitCommandEncoder];
 	if (!blit)
 		return PYROWAVE_ERROR_GENERIC;
-	// The payload allocation counters, the RDO buckets and the per block quant
-	// decisions are all accumulated into, so they start from zero. The rest of the
-	// payload buffer is fully overwritten by whatever is coded.
+	// Accumulated into, so they have to start from zero. The rest of the payload buffer
+	// is fully overwritten by whatever is coded.
 	[blit fillBuffer:encoder->payload_data range:NSMakeRange(0, 2 * sizeof(uint32_t)) value:0];
 	[blit fillBuffer:encoder->bucket_buffer range:NSMakeRange(0, encoder->bucket_buffer.length) value:0];
 	[blit fillBuffer:encoder->quant_buffer range:NSMakeRange(0, encoder->quant_buffer.length) value:0];
-	// A block's payload rarely ends on a word boundary, and the packer never writes
-	// the leftover bytes of its final word. They still go out on the wire, so clear
-	// them rather than shipping whatever this buffer last held.
+	// A block's payload rarely ends on a word boundary and the packer never writes the
+	// leftover bytes of its final word, which still go out on the wire.
 	//
-	// This does not make the bitstream byte for byte reproducible. The unused bits of
-	// a block's last sign byte come from shared_sign_bank in block_packing.comp,
-	// which is never initialized and is updated with atomicAnd/atomicOr that
-	// preserve bits outside the write mask, so those bits are leftover threadgroup
-	// memory. The decoder reads only as many sign bits as there are significant
-	// coefficients and ignores the rest; the Vulkan encoder behaves the same way.
+	// This does NOT make the bitstream byte for byte reproducible, so never diff two
+	// bitstreams to check a change -- diff the decoded output, which is deterministic.
+	// The unused bits of a block's last sign byte come from shared_sign_bank in
+	// block_packing.comp, which is never initialized and is updated with atomicAnd/Or
+	// that preserve bits outside the write mask, so they are leftover threadgroup
+	// memory. Decoders read only as many sign bits as there are significant
+	// coefficients; the Vulkan encoder behaves the same way.
 	[blit fillBuffer:encoder->bitstream range:NSMakeRange(0, target_size + meta_size) value:0];
 	[blit endEncoding];
 
-	// One concurrent encoder for the whole pipeline, with explicit barriers exactly
-	// where the Vulkan encoder has them. Everything between two barriers is
-	// mutually independent -- each dispatch owns a distinct (component, level, band)
-	// region -- and a serial encoder would barrier between all ~170 of them.
+	// One concurrent encoder for the whole pipeline, with explicit barriers exactly where
+	// the Vulkan encoder has them. Everything between two barriers is independent -- each
+	// dispatch owns a distinct (component, level, band) region -- and a serial encoder
+	// would barrier between all ~170.
 	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoderWithDispatchType:
 			bench_serial_dispatch() ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
 	if (!enc)
@@ -958,8 +955,7 @@ pyrowave_result upload_cpu_input(pyrowave_encoder encoder, const pyrowave_cpu_bu
 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
 
 	// The textures are reused across frames, so the previous encode has to be done
-	// reading them. In practice this is free: the packet queries have already
-	// waited by the time a caller asks for another frame.
+	// reading them. Free in practice: the packet queries have already waited.
 	if (encoder->pending)
 		[encoder->pending waitUntilCompleted];
 
@@ -968,7 +964,10 @@ pyrowave_result upload_cpu_input(pyrowave_encoder encoder, const pyrowave_cpu_bu
 	for (int plane = 0; plane < num_planes; plane++)
 	{
 		auto *texture = encoder->cpu_input.owned[plane];
-		[texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height) mipmapLevel:0 withBytes:input->data[plane] bytesPerRow:input->row_stride_in_bytes[plane]];
+		[texture replaceRegion:MTLRegionMake2D(0, 0, texture.width, texture.height)
+		           mipmapLevel:0
+		             withBytes:input->data[plane]
+		           bytesPerRow:input->row_stride_in_bytes[plane]];
 	}
 
 	return PYROWAVE_SUCCESS;
@@ -1205,9 +1204,9 @@ pyrowave_result pyrowave_encoder_packetize(pyrowave_encoder encoder, pyrowave_pa
 }
 
 #ifdef PYROWAVE_METAL_BENCH_HOOKS
-// Not in pyrowave_metal.h: the encoder owns its command buffer and deliberately
-// does not hand it out, so there is no way for a caller to time the GPU work
-// itself. tools/metal/bench_encode.cpp declares this extern directly.
+// Not in pyrowave_metal.h: the encoder owns its command buffer and deliberately does not
+// hand it out, so a caller cannot time the GPU work itself. tools/metal/bench_encode.mm
+// declares this extern directly.
 extern "C" double pyrowave_bench_last_gpu_ms(pyrowave_encoder encoder)
 {
 	return encoder ? encoder->bench_last_gpu_ms : -1.0;

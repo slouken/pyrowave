@@ -4,7 +4,7 @@
 // Metal backend for the PyroWave decoder. Mirrors the compute path of
 // pyrowave_decoder.cpp; the fragment iDWT path is not ported. The device object
 // and the wavelet pyramid it shares with the encoder live in
-// pyrowave_metal_common.cpp.
+// pyrowave_metal_common.mm.
 
 #include "pyrowave_metal_common.hpp"
 
@@ -36,34 +36,28 @@ struct IdwtPush
 };
 static_assert(sizeof(IdwtPush) == 16, "IdwtPush layout mismatch.");
 
-// How many frames' worth of upload buffers exist. Decode rotates through them, so
-// this is how many decodes a caller may have in flight before acquiring a slot has
-// to wait for the oldest to finish. Two would suffice for the intended display loop;
-// four leaves headroom without the memory mattering (~1 MB per slot at 4K).
+// How many decodes a caller may have in flight before acquiring a slot waits for the
+// oldest. Two would do for the intended display loop; four is headroom at ~1 MB per
+// slot at 4K.
 constexpr size_t UploadSlotCount = 4;
 
-// A pair of upload buffers. The GPU may still be reading a previous frame's buffers,
-// so a slot is only rewritten once the command buffer that consumed it has completed.
 struct UploadSlot
 {
 	id<MTLBuffer> offsets;
 	id<MTLBuffer> payload;
-	// The command buffer that last read this slot, retained so that reuse can wait on
-	// it. Null once it has completed and been reclaimed.
 	id<MTLCommandBuffer> consumer;
 
 	void reclaim()
 	{
 		if (!consumer)
 			return;
-		// Returns immediately unless the caller really is UploadSlotCount decodes
-		// ahead of the GPU.
+		// Returns immediately unless the caller really is UploadSlotCount ahead.
 		[consumer waitUntilCompleted];
 		consumer = nil;
 	}
 
-	// No destructor needed: ARC releases the buffers and the command buffer, and
-	// Metal keeps anything a command buffer still references alive on its own.
+	// No destructor: ARC releases both buffers, and Metal keeps anything a command
+	// buffer still references alive on its own.
 };
 }
 
@@ -75,23 +69,19 @@ struct pyrowave_decoder_opaque
 	BitstreamParser parser;
 	WaveletPyramid wavelet;
 
-	// Fixed size on purpose. This used to be a vector that appended a slot whenever
-	// none was free, which grows without bound if a caller submits decodes faster
-	// than they complete -- unboundedly in memory, and the linear scan for a free
-	// slot got slower with it.
+	// Fixed size on purpose: a vector that appended whenever no slot was free grew
+	// without bound when a caller submitted faster than the GPU drained.
 	UploadSlot upload_slots[UploadSlotCount];
 	size_t next_upload_slot = 0;
 };
 
 namespace
 {
-// Grows a shared storage buffer to at least `size` bytes, keeping some slack so
-// that a steadily sized stream stops reallocating.
+// Overallocates so that a steadily sized stream stops reallocating.
 bool ensure_buffer(pyrowave_device device, __strong id<MTLBuffer> *buffer, size_t size)
 {
 	if (*buffer && (*buffer).length >= size)
 		return true;
-
 
 	size_t allocate = size * 2;
 	if (allocate < 64 * 1024)
@@ -151,7 +141,9 @@ void encode_dequant(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc, 
 				push.block_stride_32x32 = layout.block_meta[component][level][band].block_stride_32x32;
 				[enc setBytes:&push length:sizeof(push) atIndex:1];
 
-				[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32, (push.resolution[1] + 31) / 32, 1) threadsPerThreadgroup:MTLSizeMake(DequantThreadgroupSize, 1, 1)];
+				[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 31) / 32,
+				                                     (push.resolution[1] + 31) / 32, 1)
+				      threadsPerThreadgroup:MTLSizeMake(DequantThreadgroupSize, 1, 1)];
 			}
 		}
 	}
@@ -166,7 +158,9 @@ void encode_idwt_dispatch(pyrowave_decoder decoder, id<MTLComputeCommandEncoder>
 	[enc setTexture:input atIndex:0];
 	[enc setTexture:output atIndex:1];
 	[enc setSamplerState:decoder->device->mirror_repeat_sampler atIndex:0];
-	[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 15) / 16, (push.resolution[1] + 15) / 16, 1) threadsPerThreadgroup:MTLSizeMake(IdwtThreadgroupSize, 1, 1)];
+	[enc dispatchThreadgroups:MTLSizeMake((push.resolution[0] + 15) / 16,
+	                                     (push.resolution[1] + 15) / 16, 1)
+	      threadsPerThreadgroup:MTLSizeMake(IdwtThreadgroupSize, 1, 1)];
 }
 
 void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
@@ -177,9 +171,8 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
-		// Levels are a dependent chain: this one reads the LL band the previous
-		// one produced. Within a level the three components are independent, so
-		// the encoder runs concurrently and only the level boundaries barrier.
+		// Levels are a dependent chain: this one reads the LL band the previous one
+		// produced. Components within a level are independent, so only levels barrier.
 		if (input_level != DecompositionLevels - 1)
 			[enc memoryBarrierWithScope:MTLBarrierScopeTextures];
 
@@ -192,8 +185,7 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 
 		if (input_level == 0)
 		{
-			// Final level writes the output planes directly. Under 420 the chroma
-			// planes were already finished one level earlier.
+			// Under 420 the chroma planes were already finished one level earlier.
 			const int components = chroma_420 ? 1 : NumComponents;
 			for (int c = 0; c < components; c++)
 			{
@@ -219,7 +211,6 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 	}
 }
 
-// Checks a caller supplied output plane against what the shaders will write.
 bool validate_plane(pyrowave_device device, id<MTLTexture> texture, int index, int width, int height)
 {
 	if (!texture)
@@ -360,10 +351,8 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 
 	auto *cmd = (__bridge id<MTLCommandBuffer>)(command_buffer);
 
-	// Every dequant dispatch writes a distinct (component, level, band) region of
-	// the pyramid and none reads another's output, so they can all run at once. A
-	// serial encoder would put a full barrier between each of the ~42 of them,
-	// which dominates the frame at low resolutions where the dispatches are tiny.
+	// Every dequant dispatch writes a distinct (component, level, band) region and reads
+	// no other's output. Serialized, each of the ~42 is far too small to fill the GPU.
 	auto dequant_enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 	if (!dequant_enc)
 		return PYROWAVE_ERROR_GENERIC;
@@ -372,10 +361,8 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_dequant(decoder, dequant_enc, slot);
 	[dequant_enc endEncoding];
 
-	// The iDWT is a dependent chain across levels, but the three components within
-	// a level are independent, so this is also concurrent with explicit barriers
-	// at the level boundaries only. Ordering against the dequant work above comes
-	// from the encoder boundary, which Metal tracks automatically.
+	// Also concurrent, barriering only at level boundaries. Ordering against the
+	// dequant work above comes free from the encoder boundary.
 	auto idwt_enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 	if (!idwt_enc)
 		return PYROWAVE_ERROR_GENERIC;
@@ -384,8 +371,7 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_idwt(decoder, idwt_enc, planes);
 	[idwt_enc endEncoding];
 
-	// Retained until this slot comes round again, so its buffers cannot be rewritten
-	// while the GPU is still reading them.
+	// Retained until this slot comes round again, so the GPU is never still reading.
 	slot->consumer = cmd;
 
 	decoder->parser.mark_frame_decoded();
