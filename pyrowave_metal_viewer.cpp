@@ -5,14 +5,20 @@
 //
 //   pyrowave-metal-viewer stream.bin [--loop] [--fps N]
 //
-// Fully zero-copy: each of the three decoded planes lives in its own IOSurface,
-// the decoder's compute shaders write straight into MTLTextures wrapping those
-// surfaces, and SDL's Metal renderer wraps the same surfaces to do the YCbCr to
-// RGB conversion. No pixel data is ever copied or read back to the CPU.
+// Fully zero-copy, and without allocating any texture storage of its own: SDL
+// creates the three plane textures, this borrows their MTLTextures back out, and
+// the decoder's compute shaders write straight into them. SDL then samples the
+// very same textures to do the YCbCr to RGB conversion. No pixel data is copied
+// or read back to the CPU.
 //
-// This needs the per plane IOSurface texture properties, since Metal does not
-// allow an IOSurface backed texture to be an array texture, which is how SDL
-// otherwise stores the two chroma planes.
+// Because the planes are one set of MTLTexture objects rather than two aliasing
+// views of shared memory, ordering the decode against the render needs nothing
+// but submission order on a single queue -- so this borrows the renderer's own
+// MTLCommandQueue too, and commits the decode before issuing the draw.
+//
+// This needs three things from the Metal renderer: writable plane textures
+// (SDL_PROP_TEXTURE_CREATE_METAL_SHADER_WRITE_BOOLEAN), the per plane MTLTexture
+// properties to fetch them, and the renderer's device and queue.
 //
 // Both chroma modes map onto a 3 plane SDL format, which is exactly what the
 // decoder emits: SDL_PIXELFORMAT_IYUV for 4:2:0 (half resolution chroma) and
@@ -20,7 +26,6 @@
 
 #include <Metal/Metal.hpp>
 
-#include <IOSurface/IOSurfaceRef.h>
 #include <SDL3/SDL.h>
 
 #include "pyrowave_metal.h"
@@ -29,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 
 using namespace PyroWave;
@@ -189,49 +195,15 @@ bool load_stream(const char *path, StreamInfo &info)
 
 	return true;
 }
-
-void dict_set_int(CFMutableDictionaryRef dict, CFStringRef key, int value)
-{
-	CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
-	CFDictionarySetValue(dict, key, number);
-	CFRelease(number);
-}
-
-// One single channel 8-bit surface per plane. Kept separate rather than using a
-// multi plane surface so each can back its own 2D texture.
-IOSurfaceRef create_plane_surface(int width, int height)
-{
-	CFMutableDictionaryRef props = CFDictionaryCreateMutable(kCFAllocatorDefault, 5,
-	                                                         &kCFTypeDictionaryKeyCallBacks,
-	                                                         &kCFTypeDictionaryValueCallBacks);
-	dict_set_int(props, kIOSurfaceWidth, width);
-	dict_set_int(props, kIOSurfaceHeight, height);
-	dict_set_int(props, kIOSurfaceBytesPerElement, 1);
-	dict_set_int(props, kIOSurfacePixelFormat, 'L008');
-	IOSurfaceRef surface = IOSurfaceCreate(props);
-	CFRelease(props);
-	return surface;
-}
-
-MTL::Texture *create_plane_texture(MTL::Device *device, IOSurfaceRef surface, int width, int height)
-{
-	auto *desc = MTL::TextureDescriptor::alloc()->init();
-	desc->setTextureType(MTL::TextureType2D);
-	desc->setPixelFormat(MTL::PixelFormatR8Unorm);
-	desc->setWidth(width);
-	desc->setHeight(height);
-	desc->setUsage(MTL::TextureUsageShaderWrite | MTL::TextureUsageShaderRead);
-	// IOSurface backed textures cannot be private.
-	desc->setStorageMode(MTL::StorageModeShared);
-	auto *texture = device->newTexture(desc, surface, NS::UInteger(0));
-	desc->release();
-	return texture;
-}
 }
 
 int main(int argc, char **argv)
 {
 	const char *stream_path = nullptr;
+	const char *screenshot_path = nullptr;
+	bool report_timing = false;
+	bool sync_decode = false;
+	int bench_frames = 0;
 	bool loop = false;
 	double fps_override = 0.0;
 
@@ -241,6 +213,20 @@ int main(int argc, char **argv)
 			loop = true;
 		else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc)
 			fps_override = atof(argv[++i]);
+		// Dump the composited result after the first frame and exit, so the whole
+		// decode-into-SDL's-textures path can be checked without a human looking.
+		else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc)
+			screenshot_path = argv[++i];
+		// Reports decode GPU time, which we can read straight off our own command
+		// buffer even though it was created from the renderer's queue.
+		else if (strcmp(argv[i], "--timing") == 0)
+			report_timing = true;
+		// Runs uncapped for N frames and reports wall clock throughput.
+		else if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc)
+			bench_frames = atoi(argv[++i]);
+		// Restores the CPU stall the IOSurface based flow needed, for comparison.
+		else if (strcmp(argv[i], "--sync-decode") == 0)
+			sync_decode = true;
 		else if (argv[i][0] == '-')
 		{
 			fprintf(stderr, "Unknown argument %s\n", argv[i]);
@@ -252,7 +238,7 @@ int main(int argc, char **argv)
 
 	if (!stream_path)
 	{
-		fprintf(stderr, "Usage: %s stream.bin [--loop] [--fps N]\n", argv[0]);
+		fprintf(stderr, "Usage: %s stream.bin [--loop] [--fps N] [--screenshot out.bmp]\n", argv[0]);
 		return EXIT_FAILURE;
 	}
 
@@ -296,35 +282,29 @@ int main(int argc, char **argv)
 	SDL_SetRenderLogicalPresentation(renderer, info.width, info.height,
 	                                 SDL_LOGICAL_PRESENTATION_LETTERBOX);
 
-	auto *mtl = MTL::CreateSystemDefaultDevice();
-	if (!mtl || !pyrowave_device_is_supported(mtl))
+	// Otherwise the throughput measurement is just the display's refresh rate.
+	if (bench_frames)
+		SDL_SetRenderVSync(renderer, SDL_RENDERER_VSYNC_DISABLED);
+
+	// Share the renderer's own device and queue rather than making our own, so the
+	// decode and the render are the same device's resources and are ordered against
+	// each other by nothing more than command buffer submission order.
+	SDL_PropertiesID renderer_props = SDL_GetRendererProperties(renderer);
+	auto *mtl = static_cast<MTL::Device *>(
+			SDL_GetPointerProperty(renderer_props, SDL_PROP_RENDERER_METAL_DEVICE_POINTER, nullptr));
+	auto *queue = static_cast<MTL::CommandQueue *>(
+			SDL_GetPointerProperty(renderer_props, SDL_PROP_RENDERER_METAL_COMMAND_QUEUE_POINTER, nullptr));
+
+	if (!mtl || !queue)
 	{
-		fprintf(stderr, "No supported Metal device.\n");
+		fprintf(stderr, "The metal renderer did not publish its device and command queue.\n");
 		return EXIT_FAILURE;
 	}
 
-	const int chroma_width = is_420 ? info.width / 2 : info.width;
-	const int chroma_height = is_420 ? info.height / 2 : info.height;
-
-	IOSurfaceRef surfaces[3] = {};
-	MTL::Texture *planes[3] = {};
-	for (int i = 0; i < 3; i++)
+	if (!pyrowave_device_is_supported(mtl))
 	{
-		const int w = i == 0 ? info.width : chroma_width;
-		const int h = i == 0 ? info.height : chroma_height;
-
-		surfaces[i] = create_plane_surface(w, h);
-		if (!surfaces[i])
-		{
-			fprintf(stderr, "IOSurfaceCreate failed for plane %d.\n", i);
-			return EXIT_FAILURE;
-		}
-		planes[i] = create_plane_texture(mtl, surfaces[i], w, h);
-		if (!planes[i])
-		{
-			fprintf(stderr, "Failed to wrap plane %d in a Metal texture.\n", i);
-			return EXIT_FAILURE;
-		}
+		fprintf(stderr, "No supported Metal device.\n");
+		return EXIT_FAILURE;
 	}
 
 	SDL_Colorspace colorspace;
@@ -339,10 +319,8 @@ int main(int argc, char **argv)
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, info.width);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, info.height);
 	SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, colorspace);
-	// Named by component, so the decoder's Cb and Cr map straight across.
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_POINTER, surfaces[0]);
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_U_POINTER, surfaces[1]);
-	SDL_SetPointerProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_IOSURFACE_V_POINTER, surfaces[2]);
+	// The decoder writes into these planes with a compute shader.
+	SDL_SetBooleanProperty(props, SDL_PROP_TEXTURE_CREATE_METAL_SHADER_WRITE_BOOLEAN, true);
 	SDL_Texture *texture = SDL_CreateTextureWithProperties(renderer, props);
 	SDL_DestroyProperties(props);
 
@@ -350,6 +328,29 @@ int main(int argc, char **argv)
 	{
 		fprintf(stderr, "SDL_CreateTextureWithProperties failed: %s\n", SDL_GetError());
 		return EXIT_FAILURE;
+	}
+
+	// SDL allocated the planes; borrow them rather than supplying our own storage.
+	// Named by component, so the decoder's Cb and Cr map straight across.
+	static const char *plane_props[3] = {
+		SDL_PROP_TEXTURE_METAL_TEXTURE_POINTER,
+		SDL_PROP_TEXTURE_METAL_TEXTURE_U_POINTER,
+		SDL_PROP_TEXTURE_METAL_TEXTURE_V_POINTER,
+	};
+	SDL_PropertiesID texture_props = SDL_GetTextureProperties(texture);
+	MTL::Texture *planes[3] = {};
+	for (int i = 0; i < 3; i++)
+	{
+		planes[i] = static_cast<MTL::Texture *>(
+				SDL_GetPointerProperty(texture_props, plane_props[i], nullptr));
+		if (!planes[i])
+		{
+			fprintf(stderr, "SDL did not publish a Metal texture for plane %d.\n", i);
+			return EXIT_FAILURE;
+		}
+		printf("  plane %d: %ux%u, usage %#x\n", i,
+		       unsigned(planes[i]->width()), unsigned(planes[i]->height()),
+		       unsigned(planes[i]->usage()));
 	}
 
 	pyrowave_device_create_info device_info = {};
@@ -380,10 +381,10 @@ int main(int argc, char **argv)
 	for (int i = 0; i < 3; i++)
 		buffers.planes[i] = planes[i];
 
-	auto *queue = mtl->newCommandQueue();
-
 	const uint64_t frame_time_ns = uint64_t(1e9 / (fps > 0.0 ? fps : 60.0));
 	size_t frame_index = 0;
+	std::vector<double> decode_ms;
+	std::vector<double> wall_ms;
 	bool running = true;
 	bool have_frame = false;
 
@@ -428,20 +429,28 @@ int main(int argc, char **argv)
 				}
 				else
 				{
+					// This command buffer came from the renderer's own queue, so
+					// committing it here orders it ahead of everything SDL submits
+					// for this frame. No CPU wait, and no event or fence either.
 					cmd->commit();
-					// SDL renders on its own command buffer, so make sure the
-					// writes into the surfaces have landed before handing over.
-					cmd->waitUntilCompleted();
+					have_frame = true;
 
-					if (cmd->error())
+					if (sync_decode)
+						cmd->waitUntilCompleted();
+
+					if (report_timing)
 					{
-						fprintf(stderr, "GPU error: %s\n",
-						        cmd->error()->localizedDescription()->utf8String());
-						running = false;
-					}
-					else
-					{
-						have_frame = true;
+						// Only a benchmark blocks; this is not part of the normal path.
+						cmd->waitUntilCompleted();
+						decode_ms.push_back((cmd->GPUEndTime() - cmd->GPUStartTime()) * 1000.0);
+						if (decode_ms.size() >= 400)
+							running = false;
+						if (cmd->error())
+						{
+							fprintf(stderr, "GPU error: %s\n",
+							        cmd->error()->localizedDescription()->utf8String());
+							running = false;
+						}
 					}
 				}
 			}
@@ -459,22 +468,51 @@ int main(int argc, char **argv)
 		SDL_RenderClear(renderer);
 		if (have_frame)
 			SDL_RenderTexture(renderer, texture, nullptr, nullptr);
+		if (screenshot_path && have_frame)
+		{
+			SDL_Surface *shot = SDL_RenderReadPixels(renderer, nullptr);
+			if (!shot || !SDL_SaveBMP(shot, screenshot_path))
+			{
+				fprintf(stderr, "Screenshot failed: %s\n", SDL_GetError());
+				return EXIT_FAILURE;
+			}
+			printf("Wrote %s (%dx%d)\n", screenshot_path, shot->w, shot->h);
+			SDL_DestroySurface(shot);
+			running = false;
+		}
+
 		SDL_RenderPresent(renderer);
 
 		uint64_t elapsed = SDL_GetTicksNS() - frame_start;
-		if (elapsed < frame_time_ns)
+		if (bench_frames)
+		{
+			wall_ms.push_back(double(elapsed) / 1.0e6);
+			if (int(wall_ms.size()) >= bench_frames)
+				running = false;
+		}
+		else if (elapsed < frame_time_ns)
 			SDL_DelayNS(frame_time_ns - elapsed);
 	}
 
-	for (int i = 0; i < 3; i++)
+	if (!wall_ms.empty())
 	{
-		planes[i]->release();
-		CFRelease(surfaces[i]);
+		std::sort(wall_ms.begin(), wall_ms.end());
+		printf("wall frame time over %zu frames: min %.3f  p10 %.3f  med %.3f ms  (%.0f fps at med)\n",
+		       wall_ms.size(), wall_ms.front(), wall_ms[wall_ms.size() / 10],
+		       wall_ms[wall_ms.size() / 2], 1000.0 / wall_ms[wall_ms.size() / 2]);
 	}
-	queue->release();
+
+	if (!decode_ms.empty())
+	{
+		std::sort(decode_ms.begin(), decode_ms.end());
+		printf("decode GPU time over %zu frames: min %.3f  p10 %.3f  med %.3f ms\n",
+		       decode_ms.size(), decode_ms.front(),
+		       decode_ms[decode_ms.size() / 10], decode_ms[decode_ms.size() / 2]);
+	}
+
+	// planes, queue and mtl all belong to the renderer; only the decoder is ours.
 	pyrowave_decoder_destroy(decoder);
 	pyrowave_device_destroy(device);
-	mtl->release();
 	SDL_DestroyTexture(texture);
 	SDL_DestroyRenderer(renderer);
 	SDL_DestroyWindow(window);
