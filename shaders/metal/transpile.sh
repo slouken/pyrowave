@@ -1,12 +1,15 @@
 #!/bin/bash
 
-# Regenerates the Metal shaders for the decode path from the GLSL sources.
+# Regenerates the Metal shaders from the GLSL sources.
 #
 # Requires glslang and spirv-cross (brew install glslang spirv-cross).
-# Only the two shaders the Metal decoder needs are transpiled; the encoder,
-# the fragment iDWT path and rate control stay Vulkan only.
+# Covers both directions: the decoder's iDWT and dequant, and the encoder's DWT,
+# quant, rate control and block packing. Only the fragment iDWT path stays Vulkan
+# only, since the Metal port is compute-only.
 #
 # Run from the repository root:  ./shaders/metal/transpile.sh
+# Regenerating is expected to be byte-exact -- if the working tree comes back
+# dirty without a .comp having changed, a toolchain version moved under you.
 
 set -e
 
