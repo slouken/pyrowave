@@ -171,8 +171,9 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
 	{
-		// Levels are a dependent chain: this one reads the LL band the previous one
-		// produced. Components within a level are independent, so only levels barrier.
+		// Levels are a dependent chain: this one reads the LL band the previous
+		// one produced. Within a level the three components are independent, so
+		// the encoder runs concurrently and only the level boundaries barrier.
 		if (input_level != DecompositionLevels - 1)
 			[enc memoryBarrierWithScope:MTLBarrierScopeTextures];
 
@@ -185,7 +186,8 @@ void encode_idwt(pyrowave_decoder decoder, id<MTLComputeCommandEncoder> enc,
 
 		if (input_level == 0)
 		{
-			// Under 420 the chroma planes were already finished one level earlier.
+			// Final level writes the output planes directly. Under 420 the chroma
+			// planes were already finished one level earlier.
 			const int components = chroma_420 ? 1 : NumComponents;
 			for (int c = 0; c < components; c++)
 			{
@@ -351,8 +353,11 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 
 	auto *cmd = (__bridge id<MTLCommandBuffer>)(command_buffer);
 
-	// Every dequant dispatch writes a distinct (component, level, band) region and reads
-	// no other's output. Serialized, each of the ~42 is far too small to fill the GPU.
+	// Every dequant dispatch writes a distinct (component, level, band) region of
+	// the pyramid and none reads another's output, so they can all run at once. A
+	// serial encoder would barrier between all ~42, but the cost is underutilization
+	// rather than barrier latency: each dispatch is far too small to fill the GPU on
+	// its own, which is why this pays at low resolution and not at 1080p 4:4:4.
 	auto dequant_enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 	if (!dequant_enc)
 		return PYROWAVE_ERROR_GENERIC;
@@ -361,8 +366,10 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_dequant(decoder, dequant_enc, slot);
 	[dequant_enc endEncoding];
 
-	// Also concurrent, barriering only at level boundaries. Ordering against the
-	// dequant work above comes free from the encoder boundary.
+	// The iDWT is a dependent chain across levels, but the three components within
+	// a level are independent, so this is also concurrent with explicit barriers
+	// at the level boundaries only. Ordering against the dequant work above comes
+	// from the encoder boundary, which Metal tracks automatically.
 	auto idwt_enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 	if (!idwt_enc)
 		return PYROWAVE_ERROR_GENERIC;
@@ -371,7 +378,8 @@ pyrowave_result pyrowave_decoder_decode(pyrowave_decoder decoder,
 	encode_idwt(decoder, idwt_enc, planes);
 	[idwt_enc endEncoding];
 
-	// Retained until this slot comes round again, so the GPU is never still reading.
+	// Retained until this slot comes round again, so its buffers cannot be rewritten
+	// while the GPU is still reading them.
 	slot->consumer = cmd;
 
 	decoder->parser.mark_frame_decoded();

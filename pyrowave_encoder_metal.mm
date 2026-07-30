@@ -345,8 +345,9 @@ bool ensure_encode_pipelines(pyrowave_device device)
 		}
 	}
 
-	// resolve_rate_control declares its workgroup size as a specialization constant and
-	// requires it to equal the SIMD width, so its subgroup scan stays within one group.
+	// resolve_rate_control declares its workgroup size as a specialization
+	// constant and requires it to equal the SIMD width, so the whole threadgroup
+	// is one SIMD group and its subgroup scan needs no cross-group communication.
 	if (auto *library = compile_library(device, resolve_rate_control_msl_source, "resolve_rate_control"))
 	{
 		uint32_t threadgroup_size = ResolveThreadgroupSize;
@@ -694,8 +695,9 @@ void dispatch_quant(pyrowave_encoder encoder, id<MTLComputeCommandEncoder> enc)
 		push.inv_resolution[1] = 1.0f / float(push.resolution[1]);
 		push.input_layer = float(band);
 
-		// The round trip through the 8 bit quant code is deliberate: the decoder only
-		// sees the code, so quantize against what it will dequantize with.
+		// The round trip through the 8 bit quant code is deliberate: the decoder
+		// only ever sees the code, so quantize against the value it will dequantize
+		// with rather than the ideal one.
 		const float quant_res = get_quant_resolution(level, component, band, precision);
 		push.quant_resolution = 1.0f / decode_quant(encode_quant(1.0f / quant_res));
 		push.rdo_distortion_scale =
@@ -965,7 +967,8 @@ pyrowave_result upload_cpu_input(pyrowave_encoder encoder, const pyrowave_cpu_bu
 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
 
 	// The textures are reused across frames, so the previous encode has to be done
-	// reading them. Free in practice: the packet queries have already waited.
+	// reading them. In practice this is free: the packet queries have already
+	// waited by the time a caller asks for another frame.
 	if (encoder->pending)
 		[encoder->pending waitUntilCompleted];
 
